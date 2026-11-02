@@ -156,6 +156,13 @@ class KnowledgeBase:
                    VALUES (?,?,?,?,?,?)""",
                 (sha, "spu", f"{miss.get('fp')} size={miss.get('size')}", "",
                  "lift + register this SPU image", now))
+        for ea in (boot or {}).get("spurs_queue_spin") or []:
+            self.db.execute(
+                """INSERT OR IGNORE INTO blockers (sha, kind, detail, name,
+                                                  resolution, seen_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (sha, "spurs-queue", ea, "",
+                 "producer never enqueued: implement job submission/policy", now))
 
         self._learn_settings(report)
         self.db.commit()

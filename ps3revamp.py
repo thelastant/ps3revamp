@@ -1472,6 +1472,8 @@ def classify_boot(text: str, rc: int | None, seconds: float) -> dict:
     spu_block = [int(s) for s in re.findall(r"EventFlagWait BLOCKED[^\n]*? (\d+)s ",
                                             text)]
     spu_stall = bool(spu_hits and spu_block and max(spu_block) >= 2)
+    queue_spin = sorted(set(re.findall(r"\[spu-spin\][^\n]*?GETLLAR ea=(0x[0-9A-Fa-f]+)",
+                                       text)))
     reached = []
     for pat, label in ((r"\[milestone\]\s*(.+)", "milestone"),
                        (r"ppu_run returned (-?\d+)", "exit"),
@@ -1484,6 +1486,8 @@ def classify_boot(text: str, rc: int | None, seconds: float) -> dict:
         verdict = "crashed"
     if spu_miss:
         verdict = "spu-miss"
+    elif queue_spin:
+        verdict = "spurs-queue"
     elif spu_stall:
         verdict = "spu-stall"
     elif indirect:
@@ -1499,6 +1503,7 @@ def classify_boot(text: str, rc: int | None, seconds: float) -> dict:
         "unresolved_calls": indirect[:200], "spin_addresses": spins[:50],
         "spu_misses": [{"fp": fp, "size": size} for fp, size in spu_miss][:50],
         "spu_hits": spu_hits, "spu_stall": spu_stall,
+        "spurs_queue_spin": queue_spin[:8],
         "observations": reached[-20:], "log_tail": text.splitlines()[-80:],
     }
 
@@ -1519,6 +1524,10 @@ def next_step(diag: dict | None, plan: dict | None) -> str:
     if v == "spu-stall":
         return ("SPURS task/policy signalling is the remaining gap; fetch the "
                 "reference with `docs --topic rpcs3-spurs --fetch`")
+    if v == "spurs-queue":
+        return ("the SPU workers are spinning on an empty SPURS queue: the "
+                "producer (job submission/policy) never enqueued. Trace with "
+                "PS3_HLE_TRACE=2000 and compare against RPCS3's sys_spurs")
     if v == "missing-lift":
         return ("missing lifted functions; rerun with `--analyzer ghidra` so the "
                 "independent decoder adds the starts the OPD table misses")
