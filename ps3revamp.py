@@ -208,6 +208,30 @@ def _vc_env(vcvars: Path) -> dict:
     return env
 
 
+def _clang_version(exe: Path) -> tuple[int, int, int]:
+    try:
+        r = subprocess.run([str(exe), "--version"], capture_output=True, text=True,
+                           timeout=30)
+        m = re.search(r"clang version (\d+)\.(\d+)\.(\d+)", r.stdout or "")
+        if m:
+            return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    except Exception:
+        pass
+    return (0, 0, 0)
+
+
+def _best_clang_cl(candidates: list[Path | None]) -> Path | None:
+    best = None
+    best_v = (0, 0, 0)
+    for c in candidates:
+        if not c or not Path(c).is_file():
+            continue
+        v = _clang_version(Path(c))
+        if v > best_v:
+            best, best_v = Path(c), v
+    return best
+
+
 def discover(save: bool = False) -> Env:
     env = Env()
     cfg = {}
@@ -286,19 +310,23 @@ def discover(save: bool = False) -> Env:
     if vc:
         try:
             vcenv = _vc_env(vc)
-            cands = []
+            cands: list[Path | None] = []
+            if os.environ.get("PS3REVAMP_CLANG_CL"):
+                cands.append(Path(os.environ["PS3REVAMP_CLANG_CL"]))
+            if os.environ.get("LLVM_HOME"):
+                cands.append(Path(os.environ["LLVM_HOME"]) / "bin" / "clang-cl.exe")
+            cands.append(ROOT / "toolchain" / "llvm" / "bin" / "clang-cl.exe")
             cc = shutil.which("clang-cl", path=vcenv.get("PATH", ""))
             if cc:
                 cands.append(Path(cc))
             vsroot = vc.parents[3]
             cands += [vsroot / "VC" / "Tools" / "LLVM" / "x64" / "bin" / "clang-cl.exe",
                       vsroot / "VC" / "Tools" / "LLVM" / "bin" / "clang-cl.exe"]
-            for c in cands:
-                if c.is_file():
-                    env.clang_cl = c
-                    env.vc_env = vcenv
-                    env.vcvars = vc
-                    break
+            best = _best_clang_cl(cands)
+            if best:
+                env.clang_cl = best
+                env.vc_env = vcenv
+                env.vcvars = vc
         except Exception as e:
             env.problems.append(f"vcvars failed: {e}")
 
@@ -2538,6 +2566,9 @@ def doctor(args) -> int:
     print(f"clang       : {env.clang or 'MISSING'}")
     print(f"clang++     : {env.clangxx or 'MISSING'}")
     print(f"clang-cl    : {env.clang_cl or 'not found (Visual Studio)'}")
+    if env.clang_cl:
+        v = _clang_version(env.clang_cl)
+        print(f"              clang {v[0]}.{v[1]}.{v[2]}")
     print(f"sccache     : {env.sccache or 'not installed (optional)'}")
     print(f"ghidra      : {env.ghidra_dir or 'not installed (setup --with-ghidra)'}")
     print(f"python      : {env.python}")
