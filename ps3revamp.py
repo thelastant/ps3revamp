@@ -566,6 +566,22 @@ def subsystem_of(lib: str) -> str:
     return "other"
 
 
+def merge_functions(seed: list[dict], extra: list[dict]) -> list[dict]:
+    """Union two function lists by start address; keep the larger extent."""
+    by_start: dict[int, dict] = {}
+    for f in seed:
+        by_start[int(f["start"], 16)] = dict(f)
+    for f in extra:
+        a = int(f["start"], 16)
+        if a in by_start:
+            cur = by_start[a]
+            if int(f.get("end", "0x0"), 16) > int(cur.get("end", "0x0"), 16):
+                cur["end"] = f["end"]
+        else:
+            by_start[a] = dict(f)
+    return [by_start[a] for a in sorted(by_start)]
+
+
 def port_plan(imports: list[dict], cov: dict, names: dict) -> dict:
     """Group the title's firmware surface by subsystem and flag the risk."""
     cov_map = {}
@@ -1139,7 +1155,8 @@ def port(args) -> int:
             log("stage", f"      IDA found {len(got)} functions")
         elif args.analyzer == "ida":
             eprint("! " + analyzer_status.get("reason", "IDA unavailable"))
-    if args.analyzer in ("ghidra", "auto") and not extra_funcs:
+    if (args.analyzer == "ghidra" or
+            (args.analyzer == "auto" and len(functions) < 1500)) and not extra_funcs:
         got, analyzer_status = analyze_with_ghidra(env, elf, analysis / "ghidra")
         extra_funcs += got
     if extra_funcs:
@@ -1330,7 +1347,19 @@ def port(args) -> int:
     report["finished"] = time.strftime("%Y-%m-%d %H:%M:%S")
     dump_json(report, out / "port.json")
     write_report(out, report, proj, elf, game_dir)
+    advice = next_step(report.get("boot"), plan)
+    report["next_step"] = advice
+    if args.package:
+        import types
+        try:
+            package_cmd(types.SimpleNamespace(dir=str(out), out=str(out / "dist"),
+                                              link_assets=True, no_assets=False))
+            advice = "packaged: double-click the exe in dist\\ (or press Play)"
+        except Exception as e:
+            eprint(f"! packaging failed: {e}")
+    report["next_step"] = advice
     print()
+    print(f"Next step : {advice}")
     print(f"Port tree : {out}")
     print(f"Project   : {proj}")
     print(f"Report    : {out / 'PORT.md'}")
@@ -1472,6 +1501,33 @@ def classify_boot(text: str, rc: int | None, seconds: float) -> dict:
         "spu_hits": spu_hits, "spu_stall": spu_stall,
         "observations": reached[-20:], "log_tail": text.splitlines()[-80:],
     }
+
+
+def next_step(diag: dict | None, plan: dict | None) -> str:
+    """One actionable line for the user, derived from the boot verdict."""
+    if not diag:
+        return "run `port ... --build --test 20` to boot-test the build"
+    v = diag.get("verdict")
+    if v == "ran":
+        if "graphics" in " ".join(diag.get("observations") or []):
+            return ("the title is running; verify gameplay and input, then "
+                    "`package` it into a game folder")
+        return "it boots; run `package` to produce the Windows game folder"
+    if v == "spu-miss":
+        return ("an SPU program is not registered: run `port` again (the registry "
+                "is regenerated) or `setup --with-ghidra` then relift")
+    if v == "spu-stall":
+        return ("SPURS task/policy signalling is the remaining gap; fetch the "
+                "reference with `docs --topic rpcs3-spurs --fetch`")
+    if v == "missing-lift":
+        return ("missing lifted functions; rerun with `--analyzer ghidra` so the "
+                "independent decoder adds the starts the OPD table misses")
+    if v == "missing-hle":
+        return ("an unimplemented NID is on the critical path; `gaps` lists the "
+                "backlog, or implement that NID in project/stubs.cpp")
+    if v == "crashed":
+        return "the guest crashed; the last lines of boot.log name the site"
+    return "inspect boot.log and PORT.md"
 
 
 def write_report(out: Path, rep: dict, proj: Path, elf: Path, game: Path | None):
@@ -2262,6 +2318,8 @@ def main(argv=None) -> int:
                    help="build at -O0: much faster to compile, slower to run")
     p.add_argument("--no-learn", action="store_true",
                    help="do not record this run in the knowledge base")
+    p.add_argument("--package", action="store_true",
+                   help="assemble the standalone game folder (dist/) after the build")
     p.add_argument("--reuse-lift", action="store_true",
                    help="skip the lift if recompiled/ already has ppu_recomp.h")
     p.add_argument("--lifter-arg", action="append",

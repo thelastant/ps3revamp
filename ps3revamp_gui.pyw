@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 PS3revamp GUI -- Windows front-end.
 
@@ -175,7 +175,7 @@ class App(tk.Tk):
         # keep the GUI's interpreter for the pipeline deps
         env.setdefault("PYTHONUTF8", "1")
         cmd = [sys.executable, str(SCRIPT), "port", elf,
-               "--analyzer", "ida" if self.ida_var.get() else "native",
+               "--analyzer", "ida" if self.ida_var.get() else "auto",
                "--jobs", str(self.jobs_var.get())]
         if self.game_var.get():
             cmd += ["--game", self.game_var.get().strip().strip('"')]
@@ -184,7 +184,7 @@ class App(tk.Tk):
         if self.spu_var.get():
             cmd += ["--spu"]
         if self.build_var.get():
-            cmd += ["--build", "--test", "8"]
+            cmd += ["--build", "--test", "20", "--package"]
 
         self.log.delete("1.0", "end")
         self._say(" ".join(cmd) + "\n")
@@ -264,6 +264,17 @@ class App(tk.Tk):
         elf = self.report.get("elf")
         if not exe or not elf:
             return
+        # Prefer the packaged game layout (dist/<Title>.exe + PS3_GAME).
+        if self.port_dir:
+            man = self.port_dir / "dist" / "ps3revamp.game.json"
+            if man.is_file():
+                try:
+                    g = json.loads(man.read_text(encoding="utf-8"))
+                    if g.get("exe") and Path(g["exe"]).is_file():
+                        exe = g["exe"]
+                        elf = str(Path(g["exe"]).parent / "PS3_GAME" / "USRDIR" / "EBOOT.elf")
+                except Exception:
+                    pass
         env = os.environ.copy()
         if self.report.get("game_dir"):
             env["PS3_VFS_ROOT"] = self.report["game_dir"]
@@ -289,3 +300,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
