@@ -1821,6 +1821,12 @@ def setup_cmd(args) -> int:
                 eprint(f"! missing {b}")
             return 1
         print("all bundled components present")
+        try:
+            import vendor_runtime
+            print(vendor_runtime.apply())
+        except Exception as e:
+            eprint(f"! runtime patch: {e}")
+            return 1
         return 0
     for name, url, arc, dest, strip in SETUP_ITEMS:
         try:
@@ -1860,6 +1866,15 @@ def setup_cmd(args) -> int:
             eprint(f"! toolkit incomplete: missing {need}")
             return 1
     env = discover(save=True)
+    # The vendored runtime (our loader changes, the Project Pyrrhus SPURS
+    # series and the fixes in docs/SPURS_WORK.md) is a patch against pristine
+    # ps3recomp v0.18.0, because toolkit/ is git-ignored. Apply it once.
+    try:
+        import vendor_runtime
+        log("setup", vendor_runtime.apply())
+    except Exception as e:
+        eprint(f"! runtime patch: {e}")
+        return 1
     log("setup", f"toolkit   {env.toolkit}")
     log("setup", f"toolchain {env.toolchain}")
     log("setup", f"cmake     {env.cmake}")

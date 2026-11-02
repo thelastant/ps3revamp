@@ -85,3 +85,49 @@ Conclusion unchanged and now experimentally confirmed: the missing component is
 the SPURS taskset policy / job dispatch that would satisfy these gates and push
 work into the LF queue.
 
+
+## Session 2026-11-02: SPURS pipeline live, render loop reached
+
+The title now gets through SPURS init, dispatches real tasks, decodes queue
+items, and enters its render loop at ~17-18 FPS. Three concrete runtime bugs
+were found and fixed:
+
+1. `rsx_perf_enabled` is a FUNCTION (`int rsx_perf_enabled(void)`, see
+   `runtime/syscalls/sys_timer.c`), but the compat shim defined it as a data
+   object. The guest's `sys_timer_usleep` (lv2 syscall 141) therefore called
+   the variable's address and executed non-executable `.bss`, crashing just
+   after `cellGcmGetLabelAddress(0xFF)` / the first flip fence. Fixed in
+   `libs/input/ps3revamp_compat.c`.
+2. `_cellSpursLFQueuePush/PopBody` used `eaSignal` (the CellSpurs instance,
+   low bit tagged, e.g. `0x10009601`) as a taskset EA for
+   `spu_taskset_signal_task`. The bit landed in the wrong object and a
+   consumer parked on the queue never woke. Fixed by waking by WAIT_SIGNAL
+   object (the queue EA): `spu_taskset_wake_object()` in
+   `runtime/spu/spu_workload.c`, plus an object wake-latch consumed by the
+   WAIT_SIGNAL handler, so a push that beats the park is not lost.
+3. `cellKbRead` was a compat stub outside the `cell*/sce*/sys*` module files,
+   so `tools/gen_hle_nids.py` never registered NID 0xFF0A21B7 and the guest
+   polled it in a tight loop (thousands of `[hle] unresolved NID` lines).
+   Moved to `libs/input/cellKb.c`; the NID table now has one handler table
+   entry and only `0xFAA275A4` (AV config, harmless) remains unresolved.
+
+Added a fairness yield in the SPU lock-line path: a task polling an empty
+SPURS queue used to burn a whole core in GETLLAR (three decoder tasks pinned
+every core, loader advanced at ~1 chunk / 5 s). After a burst of polls on the
+same line the thread yields / sleeps 1 ms. Measured on the same title: 49
+chunks in 30 s instead of 4 in 45 s, and the CPU burn dropped from ~64 core-
+seconds per 6 wall seconds to ~12 cores.
+
+Measured state after the fixes (25 s probe): no blocked PPU thread, no queue
+spin in the summary, 42 taskset create/shutdown cycles, 49 `stream.dat`
+4 KiB reads, 60 draw calls, and the game window runs at 17 FPS with 28 draws
+per frame.
+
+Remaining blocker: the render loop is black. The title's per-chunk loader
+creates a taskset + 3 decoder tasks + LF queue, pushes one item, waits for
+the SPURS->PPU event flag, then tears the taskset down and repeats. After 49
+chunks the loader threads (tid 4 on sem 7, tid 5 on sem 10) stop receiving
+work and all three tasks park in WAIT_SIGNAL while the frame loop keeps
+presenting. Next: trace the guest producer that posts sems 7/10 and find the
+condition that ends the chunk loop, and inspect the `[FP] PSO FAIL
+(0x03902001, E_INVALIDARG)` pipeline that keeps some guest draws out.
