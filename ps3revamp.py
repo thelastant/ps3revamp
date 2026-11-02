@@ -1526,8 +1526,9 @@ def next_step(diag: dict | None, plan: dict | None) -> str:
                 "reference with `docs --topic rpcs3-spurs --fetch`")
     if v == "spurs-queue":
         return ("the SPU workers are spinning on an empty SPURS queue: the "
-                "producer (job submission/policy) never enqueued. Trace with "
-                "PS3_HLE_TRACE=2000 and compare against RPCS3's sys_spurs")
+                "producer (job submission/policy) never enqueued. `linkage` shows "
+                "the dead call path; `oracle` (optional) records RPCS3's run as "
+                "the reference")
     if v == "missing-lift":
         return ("missing lifted functions; rerun with `--analyzer ghidra` so the "
                 "independent decoder adds the starts the OPD table misses")
@@ -2323,6 +2324,198 @@ def probe_cmd(args) -> int:
     return 0
 
 
+def linkage_cmd(args) -> int:
+    """Static call sites vs run-time calls for every imported firmware function.
+
+    For each import stub it counts call sites in the lifted C++ and whether the
+    NID was actually called during a boot window. A stub with call sites but
+    zero calls is a *dead path*: the title has the code but never reaches it —
+    the class of failure that hides as an empty queue or a blocked thread.
+    """
+    out = Path(args.dir).resolve()
+    rep_path = out / "port.json"
+    if not rep_path.is_file():
+        eprint(f"no port.json in {out}")
+        return 1
+    rep = load_json(rep_path)
+    exe = Path(rep.get("exe") or "")
+    elf = Path(rep.get("elf") or "")
+    imports: list[dict] = []
+    for f in sorted((out / "analysis").glob("*.imports.json")):
+        imports = load_json(f)
+        break
+    if not imports:
+        eprint("no imports.json -- run the port first")
+        return 1
+    rc = out / "recompiled"
+    files = sorted(rc.glob("*.cpp"))
+    if not files:
+        eprint("no lifted sources")
+        return 1
+
+    # one pass over the generated code, remembering which func_ symbols occur
+    # One streaming pass over the generated code (it can be >1 GB, so never
+    # concatenate it): count call sites per import stub.
+    wanted: dict[str, int] = {}
+    for imp in imports:
+        wanted[f"func_{int(imp['stub'], 16):08X}"] = 0
+    call_re = re.compile(r"(func_[0-9A-F]{8})\s*\(ctx\)")
+    def_re = re.compile(r"void\s+(func_[0-9A-F]{8})\(ppu_context\* ctx\)")
+    for p in files:
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                for m in call_re.finditer(line):
+                    s = m.group(1)
+                    if s in wanted:
+                        wanted[s] += 1
+                m = def_re.search(line)
+                if m and m.group(1) in wanted:
+                    wanted[m.group(1)] -= 1
+    stub_calls = {k[5:]: max(0, v) for k, v in wanted.items()}
+
+    env = dict(os.environ)
+    env["PS3_HLE_UNRESOLVED"] = "ok"
+    env["PS3_HLE_TRACE"] = "1000000"
+    if rep.get("game_dir"):
+        env["PS3_VFS_ROOT"] = rep["game_dir"]
+    proc = subprocess.Popen([str(exe), str(elf)], cwd=str(exe.parent),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            bufsize=1, env=env)
+    called: set[str] = set()
+    t0 = time.time()
+    while time.time() - t0 < args.seconds:
+        line = proc.stdout.readline() if proc.stdout else ""
+        if not line:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.02)
+            continue
+        m = re.search(r"nid=(0x[0-9A-Fa-f]{8})", line)
+        if m:
+            called.add(m.group(1).upper())
+    if proc.poll() is None:
+        proc.terminate()
+
+    rows = []
+    for imp in imports:
+        nid = imp["nid"].upper()
+        stub = f"{int(imp['stub'], 16):08X}"
+        rows.append({"library": imp["library"], "nid": nid, "stub": "0x" + stub,
+                     "call_sites": stub_calls.get(stub, 0),
+                     "called": nid in called})
+    dead = sorted([r for r in rows if r["call_sites"] and not r["called"]],
+                  key=lambda r: -r["call_sites"])
+    never = [r for r in rows if not r["call_sites"] and not r["called"]]
+    dump_json({"windows_seconds": args.seconds,
+               "called": sum(1 for r in rows if r["called"]),
+               "total": len(rows), "dead_paths": dead,
+               "never_referenced": never, "all": rows},
+              out / "linkage.json")
+
+    print(f"linkage: {rep.get('title')}")
+    print(f"  {sum(1 for r in rows if r['called'])}/{len(rows)} imported functions "
+          f"were called in {args.seconds}s")
+    if dead:
+        print("\n  code exists, never reached (dead paths):")
+        for r in dead[:15]:
+            print(f"    {r['library']:<16} {r['nid']}  call sites={r['call_sites']}")
+    print(f"\n  {out / 'linkage.json'}")
+    return 0
+
+
+def oracle_cmd(args) -> int:
+    """Run the same title under RPCS3 and keep its log as the reference.
+
+    The port and the emulator are driven with the same inputs; the emulator's
+    log is the behavioural oracle for the parts our runtime does not implement
+    yet (SPURS scheduling, RSX, syscall ordering). Nothing is inferred: the log
+    is stored next to the port for diffing.
+    """
+    out = Path(args.dir).resolve()
+    rep_path = out / "port.json"
+    rep = load_json(rep_path) if rep_path.is_file() else {}
+    rpcs3 = None
+    for cand in (os.environ.get("PS3REVAMP_RPCS3"), rep.get("rpcs3")):
+        if cand and Path(cand).is_file():
+            rpcs3 = Path(cand)
+            break
+    if not rpcs3:
+        try:
+            from ps3revamp_tools import _find_rpcs3
+            rpcs3 = _find_rpcs3()
+        except Exception:
+            rpcs3 = None
+    if not rpcs3:
+        eprint("RPCS3 not found; set PS3REVAMP_RPCS3 to rpcs3.exe")
+        return 1
+
+    target = None
+    if rep.get("game_dir"):
+        g = Path(rep["game_dir"])
+        target = g if g.is_dir() else None
+    if not target and rep.get("elf"):
+        target = Path(rep["elf"])
+    if not target:
+        eprint("no game folder/ELF recorded in port.json")
+        return 1
+
+    log_path = None
+    for cand in (rpcs3.parent / "log" / "RPCS3.log", rpcs3.parent / "RPCS3.log"):
+        if cand.is_file():
+            log_path = cand
+            break
+    before = log_path.stat().st_size if log_path else 0
+    log("oracle", f"{rpcs3.name} --no-gui {target} ({args.seconds}s)")
+    stdout_path = out / "oracle.stdout.log"
+    with open(stdout_path, "w", encoding="utf-8", errors="replace") as so:
+        proc = subprocess.Popen([str(rpcs3), "--no-gui", str(target)],
+                                cwd=str(rpcs3.parent), stdout=so, stderr=so)
+        t0 = time.time()
+        while time.time() - t0 < args.seconds and proc.poll() is None:
+            time.sleep(0.5)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                proc.kill()
+
+    text = ""
+    if log_path and log_path.is_file():
+        with open(log_path, "rb") as fh:
+            fh.seek(before)
+            text = fh.read().decode("utf-8", errors="replace")
+    try:
+        text += "\n" + stdout_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    (out / "oracle.log").write_text(text, encoding="utf-8")
+
+    keys = {
+        "spurs_init": r"SPURS|cellSpurs",
+        "spu_task": r"SPU|task",
+        "gcm": r"RSX|GCM",
+        "flip": r"flip|present|frame",
+        "fs": r"cellFs|stream\.dat",
+    }
+    summary = {k: len(re.findall(v, text, re.IGNORECASE)) for k, v in keys.items()}
+    ours = out / "probe.log"
+    ours_text = ours.read_text(encoding="utf-8", errors="replace") if ours.is_file() else ""
+    ours_summary = {k: len(re.findall(v, ours_text, re.IGNORECASE)) for k, v in keys.items()}
+    dump_json({"rpcs3": str(rpcs3), "target": str(target),
+               "seconds": args.seconds, "oracle_lines": text.count("\n"),
+               "oracle": summary, "port": ours_summary,
+               "log": str(out / "oracle.log")}, out / "oracle.json")
+
+    print(f"oracle: {rep.get('title')}  ({text.count(chr(10))} log lines)")
+    print(f"  {'signal':<10} {'rpcs3':>8} {'port':>8}")
+    for k in keys:
+        print(f"  {k:<10} {summary[k]:>8} {ours_summary[k]:>8}")
+    print(f"\n  {out / 'oracle.log'}\n  {out / 'oracle.json'}")
+    return 0
+
+
 def doctor(args) -> int:
     env = discover(save=not args.no_save)
     ok = True
@@ -2442,6 +2635,18 @@ def main(argv=None) -> int:
     pb.add_argument("--modes", action="store_true",
                     help="try the known compatibility modes and compare verdicts")
     pb.set_defaults(fn=probe_cmd)
+
+    lk = sub.add_parser("linkage", help="static call sites vs runtime calls per "
+                                        "firmware import (finds dead code paths)")
+    lk.add_argument("dir")
+    lk.add_argument("--seconds", type=int, default=20)
+    lk.set_defaults(fn=linkage_cmd)
+
+    oc = sub.add_parser("oracle", help="run the title under RPCS3 and keep its log "
+                                        "as the behavioural reference")
+    oc.add_argument("dir")
+    oc.add_argument("--seconds", type=int, default=40)
+    oc.set_defaults(fn=oracle_cmd)
 
     p = sub.add_parser("port", help="full pipeline: ELF -> C++ -> (build)")
     p.add_argument("elf")
