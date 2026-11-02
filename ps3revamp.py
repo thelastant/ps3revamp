@@ -2055,6 +2055,65 @@ def route_cmd(args) -> int:
     return 0
 
 
+def gaps_cmd(args) -> int:
+    """Prioritised backlog: which firmware work unblocks the most titles."""
+    corpus = ROOT / "knowledge" / "corpus.json"
+    rows = []
+    if corpus.is_file():
+        data = load_json(corpus)
+        rows = data.get("titles", []) if isinstance(data, dict) else data
+    counts: dict[str, dict] = {}
+    for r in rows:
+        for m in r.get("missing", []):
+            lib = m["library"]
+            nid = m["nid"].upper()
+            c = counts.setdefault(lib, {"library": lib, "nids": {}, "titles": 0})
+            c["nids"][nid] = c["nids"].get(nid, 0) + 1
+            c["titles"] += 1
+
+    if args.kb and KnowledgeBase:
+        kb = KnowledgeBase(ROOT)
+        for lib in sorted({c["library"] for c in counts.values()}):
+            for g in kb.coverage_gaps(lib):
+                c = counts.setdefault(lib, {"library": lib, "nids": {}, "titles": 0})
+                c["nids"].setdefault(g["nid"], g["missing_runs"])
+
+    ordered = sorted(counts.values(), key=lambda c: (-len(c["nids"]), c["library"]))
+    if not ordered:
+        print("no corpus yet: run `ps3revamp.py analyze-dir <folder>` first")
+        return 0
+
+    all_nids = [n for c in ordered for n in c["nids"]]
+    named = {}
+    if all_nids and env_toolkit() is not None:
+        e = discover()
+        fake = [{"nid": n, "library": "?"} for n in all_nids[:200]]
+        named = resolve_nids(e, fake)
+
+    total = sum(len(c["nids"]) for c in ordered)
+    print(f"backlog: {total} unimplemented import(s) across {len(rows)} title(s)\n")
+    print(f"{'library':<20} {'nids':>5} {'examples'}")
+    for c in ordered:
+        examples = []
+        for nid in list(c["nids"])[:3]:
+            nm = (named.get(nid.upper()) or {}).get("name")
+            examples.append(f"{nid}={nm}" if nm else nid)
+        print(f"{c['library']:<20} {len(c['nids']):>5} {', '.join(examples)}")
+    out = ROOT / "knowledge" / "backlog.json"
+    dump_json({"titles": len(rows),
+               "libraries": [{"library": c["library"],
+                              "nids": sorted(c["nids"]),
+                              "examples": [(named.get(n.upper()) or {}).get("name")
+                                           for n in list(c["nids"])[:5]]}
+                             for c in ordered]}, out)
+    print(f"\nbacklog: {out}")
+    return 0
+
+
+def env_toolkit():
+    return discover().toolkit
+
+
 def doctor(args) -> int:
     env = discover(save=not args.no_save)
     ok = True
@@ -2161,6 +2220,10 @@ def main(argv=None) -> int:
     rt.add_argument("elf")
     rt.add_argument("--game")
     rt.set_defaults(fn=route_cmd)
+
+    gp = sub.add_parser("gaps", help="prioritised backlog of unimplemented firmware")
+    gp.add_argument("--kb", action="store_true", help="include knowledge-base history")
+    gp.set_defaults(fn=gaps_cmd)
 
     p = sub.add_parser("port", help="full pipeline: ELF -> C++ -> (build)")
     p.add_argument("elf")
