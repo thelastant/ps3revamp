@@ -2186,6 +2186,104 @@ def env_toolkit():
     return discover().toolkit
 
 
+def probe_cmd(args) -> int:
+    """Live behavioural probe of a built port.
+
+    Runs the port with diagnostics on, then turns the stream into a structured
+    answer: which thread is blocked on what, which SPU workers spin on which
+    guest address, what the queue looked like, and which imports are unresolved.
+    This is the tool's own equivalent of attaching a debugger, and it works
+    offline on any title.
+    """
+    out = Path(args.dir).resolve()
+    rep_path = out / "port.json"
+    if not rep_path.is_file():
+        eprint(f"no port.json in {out}")
+        return 1
+    rep = load_json(rep_path)
+    exe = Path(rep.get("exe") or "")
+    elf = Path(rep.get("elf") or "")
+    if not exe.is_file() or not elf.is_file():
+        eprint("port has no built executable / ELF")
+        return 1
+
+    env = dict(os.environ)
+    env["PS3_HLE_UNRESOLVED"] = "ok"
+    env["PS3_HLE_TRACE"] = str(args.hle_trace)
+    env["SPURS_TASKSET_TRACE"] = "1"
+    env["PS3_TITLE"] = window_title(rep.get("title") or "port", rep.get("sfo"))
+    if rep.get("game_dir"):
+        env["PS3_VFS_ROOT"] = rep["game_dir"]
+
+    log("probe", f"running {exe.name} for {args.seconds}s")
+    proc = subprocess.Popen([str(exe), str(elf)], cwd=str(exe.parent),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            bufsize=1, env=env)
+    lines: list[str] = []
+    t0 = time.time()
+    while time.time() - t0 < args.seconds:
+        line = proc.stdout.readline() if proc.stdout else ""
+        if not line:
+            if proc.poll() is not None:
+                break
+            time.sleep(0.02)
+            continue
+        lines.append(line.rstrip("\n"))
+    if proc.poll() is None:
+        proc.terminate()
+    text = "\n".join(lines)
+    (out / "probe.log").write_text(text, encoding="utf-8")
+
+    waits = re.findall(r"EventFlagWait BLOCKED tid=(\d+) (\d+)s on pattern (0x[0-9A-Fa-f]+)"
+                       r"[^\n]*?flagEA=(0x[0-9A-Fa-f]+)", text)
+    spins = re.findall(r"\[spu-spin\][^\n]*?pc=(0x[0-9A-Fa-f]+)[^\n]*?GETLLAR ea=(0x[0-9A-Fa-f]+)"
+                       r"[^\n]*?line: ([0-9A-Fa-f ]+)", text)
+    unimpl = sorted(set(re.findall(r"(?:Unimplemented NID|unresolved NID) (0x[0-9A-Fa-f]+)", text)))
+    hits = len(re.findall(r"dispatch HIT", text))
+    misses = sorted(set(re.findall(r"dispatch MISS fp=(0x[0-9A-Fa-f]+)", text)))
+    sleeps = re.findall(r"task (\d+) \(taskset (0x[0-9A-Fa-f]+)\) sleeping (\d+)s in WAIT_SIGNAL", text)
+
+    findings = []
+    if spins:
+        ea, last = spins[-1][1], spins[-1][2].split()
+        findings.append(
+            f"SPU workers are spinning on guest address {ea} "
+            f"(GETLLAR, last line: {' '.join(last)}).")
+        if len(last) >= 4 and last[3] in ("00000010", "00000020", "00000040"):
+            findings.append("That is an LF queue with pop=push=0: no producer enqueued work.")
+    if waits:
+        tid, secs, pat, ea = waits[-1]
+        findings.append(f"PPU thread {tid} has been blocked {secs}s on event flag {ea} "
+                        f"(pattern {pat}).")
+    if misses:
+        findings.append(f"{len(misses)} SPU image(s) dispatched with no lifted registry entry.")
+    if unimpl:
+        findings.append(f"{len(unimpl)} unimplemented NID(s): " + ", ".join(unimpl[:6]))
+    if not findings:
+        findings.append("no blocking symptom observed in the window")
+
+    result = {"verdict": rep.get("boot", {}).get("verdict"),
+              "seconds": args.seconds, "dispatch_hits": hits,
+              "spu_misses": misses, "unimplemented_nids": unimpl,
+              "waits": [{"tid": w[0], "seconds": int(w[1]), "pattern": w[2],
+                         "flag": w[3]} for w in waits[-3:]],
+              "spins": [{"pc": s[0], "ea": s[1], "line": s[2]} for s in spins[-3:]],
+              "task_sleeps": [{"task": s[0], "taskset": s[1], "seconds": int(s[2])}
+                              for s in sleeps[-3:]],
+              "findings": findings,
+              "log": str(out / "probe.log")}
+    dump_json(result, out / "probe.json")
+
+    print(f"probe: {rep.get('title')}")
+    print(f"  {args.seconds}s, {len(lines)} log lines, {hits} SPU dispatch hit(s)")
+    for f in findings:
+        print(f"  - {f}")
+    print(f"\n  full log: {out / 'probe.log'}")
+    print(f"  findings: {out / 'probe.json'}")
+    return 0
+
+
 def doctor(args) -> int:
     env = discover(save=not args.no_save)
     ok = True
@@ -2296,6 +2394,13 @@ def main(argv=None) -> int:
     gp = sub.add_parser("gaps", help="prioritised backlog of unimplemented firmware")
     gp.add_argument("--kb", action="store_true", help="include knowledge-base history")
     gp.set_defaults(fn=gaps_cmd)
+
+    pb = sub.add_parser("probe", help="live behavioural probe of a built port "
+                                      "(blocked threads, SPU spins, queue state)")
+    pb.add_argument("dir")
+    pb.add_argument("--seconds", type=int, default=20)
+    pb.add_argument("--hle-trace", type=int, default=100)
+    pb.set_defaults(fn=probe_cmd)
 
     p = sub.add_parser("port", help="full pipeline: ELF -> C++ -> (build)")
     p.add_argument("elf")
