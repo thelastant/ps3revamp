@@ -174,18 +174,21 @@ Useful flags:
 
 ## Toolchain choice
 
-`doctor` picks, in order:
+`doctor` reports exactly which compiler is used and its version. Selection is by
+**highest clang version**, then availability:
 
-1. **clang-cl** from Visual Studio (MSVC ABI, newest installed LLVM). This is
-   the supported Windows path: the runtime uses `__try/__except`, the template
-   emits `#pragma comment(lib)`, and both need the MSVC headers + Windows SDK.
+1. **clang-cl** from `toolchain\llvm\bin` (the bundled LLVM release, currently
+   **23.1.4**), `LLVM_HOME`, `PS3REVAMP_CLANG_CL`, PATH, or Visual Studio.
+   clang-cl is clang — it speaks the MSVC command line/ABI because the runtime
+   needs `__try/__except`, `#pragma comment(lib)` and the Windows SDK.
    `lld-link` links it.
-2. **clang + Ninja from the bundled llvm-mingw**, when no Visual Studio exists.
-   Configure-time patches in the generated project cover the MinGW gaps
-   (`_WIN32_WINNT`, explicit `d3d12/dxgi/d3dcompiler` imports).
+2. **clang + Ninja from the bundled llvm-mingw** (also 23.x) when clang-cl is not
+   available. Configure-time patches in the generated project cover the MinGW
+   gaps (`_WIN32_WINNT`, explicit `d3d12/dxgi/d3dcompiler` imports).
 
-MSVC `cl.exe` cannot compile the lifted code (its own docs say clang is
-required), which is why clang-cl is preferred over `cl`.
+Microsoft `cl.exe` is never used: it cannot compile the lifted code (its own
+toolkit docs require clang), and `PS3REVAMP_FORCE_MINGW=1` forces the pure
+MinGW path when needed.
 
 ---
 
