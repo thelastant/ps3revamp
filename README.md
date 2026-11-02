@@ -163,6 +163,8 @@ Useful flags:
   Runtime and scaffold always build at `/O2` (or `-O1` with MinGW clang).
 - `--fast` — build lifted code unoptimised: the quickest way to iterate.
 - `--test SECONDS` — boot the result and classify where it stopped.
+- `--deep` — after the boot test, also run `probe` and `linkage` automatically
+  (blocked thread/wait, SPU spin site, queue state, dead call paths).
 - `--chunks N` — number of generated TUs (default: ~2 per compile job, so a
   big title compiles in parallel instead of on one core).
 - `--chunk-lines N` — lower for small-RAM hosts (more, smaller C++ files).

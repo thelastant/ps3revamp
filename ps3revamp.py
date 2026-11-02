@@ -1349,12 +1349,21 @@ def port(args) -> int:
     write_report(out, report, proj, elf, game_dir)
     advice = next_step(report.get("boot"), plan)
     report["next_step"] = advice
+    if getattr(args, "deep", False) and report.get("boot"):
+        import types
+        log("stage", "deep analysis: probe + linkage")
+        try:
+            probe_cmd(types.SimpleNamespace(dir=str(out), seconds=25, hle_trace=100,
+                                            modes=False))
+            linkage_cmd(types.SimpleNamespace(dir=str(out), seconds=20))
+        except Exception as e:
+            eprint(f"! deep analysis failed: {e}")
     if args.package:
         import types
+        advice = "packaged: double-click the exe in dist\\ (or press Play)"
         try:
             package_cmd(types.SimpleNamespace(dir=str(out), out=str(out / "dist"),
                                               link_assets=True, no_assets=False))
-            advice = "packaged: double-click the exe in dist\\ (or press Play)"
         except Exception as e:
             eprint(f"! packaging failed: {e}")
     report["next_step"] = advice
@@ -2680,6 +2689,8 @@ def main(argv=None) -> int:
                    help="do not record this run in the knowledge base")
     p.add_argument("--package", action="store_true",
                    help="assemble the standalone game folder (dist/) after the build")
+    p.add_argument("--deep", action="store_true",
+                   help="after the boot test, also run probe + linkage analysis")
     p.add_argument("--reuse-lift", action="store_true",
                    help="skip the lift if recompiled/ already has ppu_recomp.h")
     p.add_argument("--lifter-arg", action="append",
@@ -2809,6 +2820,17 @@ def package_cmd(args) -> int:
     if game and not args.no_assets:
         usrdir = game / "USRDIR"
         dest = dst / "PS3_GAME" / "USRDIR"
+        if dest.exists() or dest.is_symlink():
+            try:
+                if dest.is_symlink():
+                    dest.unlink()
+                else:
+                    subprocess.run(["cmd", "/c", "rmdir", str(dest)],
+                                   capture_output=True, text=True)
+                    if dest.exists():
+                        shutil.rmtree(dest)
+            except Exception:
+                pass
         if not usrdir.is_dir():
             eprint(f"! no USRDIR in {game}; skipping assets")
         elif args.link_assets and sys.platform == "win32":
