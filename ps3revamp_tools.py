@@ -42,15 +42,18 @@ def _find_rpcs3() -> Path | None:
     return None
 
 
-def _find_ghidra() -> tuple[Path | None, str]:
-    for env in ("GHIDRA_HOME", "GHIDRA_INSTALL_DIR"):
-        p = os.environ.get(env)
+def _find_ghidra(env=None) -> tuple[Path | None, str]:
+    if env is not None and getattr(env, "ghidra_dir", None):
+        return (Path(env.ghidra_dir) / "support" / "analyzeHeadless.bat",
+                f"bundled {env.ghidra_dir}")
+    for envname in ("GHIDRA_HOME", "GHIDRA_INSTALL_DIR"):
+        p = os.environ.get(envname)
         if p and (Path(p) / "support" / "analyzeHeadless.bat").is_file():
-            return Path(p) / "support" / "analyzeHeadless.bat", f"${env}={p}"
+            return Path(p) / "support" / "analyzeHeadless.bat", f"${envname}={p}"
     exe = shutil.which("analyzeHeadless")
     if exe:
         return Path(exe), "PATH"
-    return None, "GHIDRA_HOME not set and analyzeHeadless not on PATH"
+    return None, "not installed (run `ps3revamp.py setup --with-ghidra`)"
 
 
 def registry(env) -> list[dict]:
@@ -77,7 +80,7 @@ def registry(env) -> list[dict]:
         "enable": "install Visual Studio (clang-cl) or use the bundled llvm-mingw",
     })
 
-    g, why = _find_ghidra()
+    g, why = _find_ghidra(env)
     out.append({
         "id": "ghidra",
         "name": "Ghidra (headless)",

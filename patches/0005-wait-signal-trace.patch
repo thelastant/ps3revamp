@@ -1,0 +1,21 @@
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 3ce8d0d..0ef974a 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -1435,6 +1435,16 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
+      * keeps the block-forever behaviour. Reversible, opt-in. */
+     unsigned drain = 0; { const char* e = getenv("LBP_WS_DRAIN"); if (e) { drain = (unsigned)atoi(e); if (!drain) drain = 1; } }
+     int drained = 0;
++    { static int _w = 0;
++      if (PS3_LOG_FIRST(_w, 12)) {
++          extern uint8_t* vm_base;
++          const uint32_t w = taskset_ea + CSTS_SIGNALLED + (taskId / 32u) * 4u;
++          uint32_t bits = ((uint32_t)vm_base[w] << 24) | ((uint32_t)vm_base[w + 1] << 16) |
++                          ((uint32_t)vm_base[w + 2] << 8) | vm_base[w + 3];
++          fprintf(stderr, "[ws] enter ts=0x%08X id=%u bits=%08X\n",
++                  taskset_ea, taskId, bits);
++          fflush(stderr);
++      } }
+     /* Release the global SPU-serial lock while parked so another SPU task can
+      * run (and possibly signal us); re-acquired before returning to resume. */
+     spu_serial_release();

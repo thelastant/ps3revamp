@@ -146,6 +146,7 @@ class Env:
     vc_env: dict | None = None
     vcvars: Path | None = None
     sccache: Path | None = None
+    ghidra_dir: Path | None = None
     python: Path = Path(sys.executable)
     ida_python: Path | None = None   # interpreter that can `import idapro`
     problems: list[str] = field(default_factory=list)
@@ -264,6 +265,18 @@ def discover(save: bool = False) -> Env:
     env.clang = env.clang or _find_exe(Path(shutil.which("clang") or ""))
     env.clangxx = env.clangxx or _find_exe(Path(shutil.which("clang++") or ""))
     env.sccache = _find_exe(ROOT / "toolchain" / "sccache" / "sccache.exe")
+
+    # Ghidra is used as an independent decoder for any EBOOT: it recovers
+    # function starts/names the OPD table cannot. It lives inside the project
+    # (toolchain/ghidra/<release>), never in a system install.
+    for hl in sorted((ROOT / "toolchain" / "ghidra").glob("*/support/analyzeHeadless.bat")):
+        env.ghidra_dir = hl.parent.parent
+        break
+    if not env.ghidra_dir:
+        hl = _find_exe(Path(os.environ.get("GHIDRA_INSTALL_DIR", "")) / "support"
+                       / "analyzeHeadless.bat")
+        if hl:
+            env.ghidra_dir = hl.parent.parent
 
     # 2b. Best Windows compiler: clang-cl (MSVC ABI + SEH). The toolkit's
     #     runtime uses __try/__except and the template emits #pragma comment(lib),
@@ -628,19 +641,35 @@ def analyze_with_ida(env: Env, elf: Path, outdir: Path) -> tuple[list[dict], dic
 
 
 def analyze_with_ghidra(env: Env, elf: Path, outdir: Path) -> tuple[list[dict], dict]:
-    ghidra_home = os.environ.get("GHIDRA_HOME") or os.environ.get("GHIDRA_INSTALL_DIR")
-    if not ghidra_home:
-        return [], {"used": False, "reason": "GHIDRA_HOME not set"}
+    """Independent decode of any decrypted EBOOT through Ghidra headless.
+
+    Ghidra recovers function starts from CFG/prologue patterns that the OPD
+    table misses (dead code, tail entries, PRX-style images) and gives readable
+    names for the lifted output. It runs from the copy inside this project.
+    """
+    if not env.ghidra_dir:
+        return [], {"used": False,
+                    "reason": "Ghidra not installed in this project; run "
+                              "`ps3revamp.py setup --with-ghidra`"}
     outdir.mkdir(parents=True, exist_ok=True)
-    r = run([env.python, env.tool("ghidra_analyze.py"), elf, "-o", outdir],
-            env={**os.environ, "GHIDRA_HOME": ghidra_home})
+    r = run([env.python, env.tool("ghidra_analyze.py"), elf, "-o", outdir,
+             "--ghidra-dir", env.ghidra_dir],
+            env={**os.environ, "GHIDRA_INSTALL_DIR": str(env.ghidra_dir)})
     f = outdir / "functions.json"
     if r.returncode != 0 or not f.is_file():
         return [], {"used": False, "reason": (r.stderr or r.stdout)[-800:]}
-    funcs = load_json(f)
-    return [{"start": x["addr"], "end": f"0x{int(x['addr'],16)+int(x['size']):X}",
-             "name": x.get("name", "")} for x in funcs], {
-        "used": True, "count": len(funcs), "source": "ghidra"}
+    raw = load_json(f)
+    funcs = []
+    for x in raw:
+        try:
+            addr = int(str(x.get("addr") or x.get("address")), 0)
+            size = int(x.get("size") or 0)
+        except Exception:
+            continue
+        funcs.append({"start": f"0x{addr:08X}", "end": f"0x{addr + size:08X}",
+                      "name": x.get("name", "")})
+    return funcs, {"used": True, "count": len(funcs), "source": "ghidra",
+                   "dir": str(env.ghidra_dir)}
 
 
 # --------------------------------------------------------------------------
@@ -1684,6 +1713,19 @@ def setup_cmd(args) -> int:
             except Exception as e:
                 eprint(f"! sccache (optional): {e}")
 
+    # optional: Ghidra, the independent decoder. Lives inside the project.
+    if getattr(args, "with_ghidra", False):
+        if not any((ROOT / "toolchain" / "ghidra").glob("*/support/analyzeHeadless.bat")):
+            url = ("https://github.com/NationalSecurityAgency/ghidra/releases/download/"
+                   "Ghidra_12.1_build/ghidra_12.1_PUBLIC_20260513.zip")
+            try:
+                z = _download(url, ROOT / "downloads" / "ghidra.zip")
+                _extract(z, ROOT / "toolchain" / "ghidra", 1)
+            except Exception as e:
+                eprint(f"! ghidra (optional): {e}")
+        else:
+            log("setup", "ghidra present")
+
     # sanity
     tk = ROOT / "toolkit" / "ps3recomp"
     for need in ("tools/ppu_loader.py", "tools/ppu_lifter.py", "runtime", "templates/project"):
@@ -1803,6 +1845,74 @@ def docs_cmd(args) -> int:
     return 0
 
 
+def analyze_dir_cmd(args) -> int:
+    """Scan a folder for EBOOT.elf files and report per-title coverage.
+
+    This is the corpus path: point it at an RPCS3 `dev_hdd0/game` or a dump
+    folder and it analyses every title it finds, feeding the knowledge base.
+    """
+    env = discover()
+    if not env.toolkit:
+        eprint("no toolkit")
+        return 1
+    root = Path(args.dir).resolve()
+    elfs = sorted(root.glob("**/EBOOT.elf"))[: args.limit]
+    if not elfs:
+        eprint(f"no EBOOT.elf under {root}")
+        return 1
+    kb = KnowledgeBase(ROOT) if KnowledgeBase else None
+    rows = []
+    for i, elf in enumerate(elfs, 1):
+        game = infer_game_dir(elf)
+        sfo = find_sfo(game, elf)
+        name = sfo.get("TITLE") or elf.parent.parent.name
+        log("corpus", f"[{i}/{len(elfs)}] {name}")
+        try:
+            meta = read_ps3_elf(elf)
+            tmp = WORK / "corpus" / meta.sha256[:12]
+            files = stage_loader(env, elf, tmp)
+            funcs = load_json(files["functions"])
+            imports = load_json(files["imports"])
+            cov = hle_nid_coverage(env, imports)
+            row = {
+                "title": name, "title_id": sfo.get("TITLE_ID"),
+                "elf": str(elf), "sha256": meta.sha256,
+                "functions": len(funcs), "imports": len(imports),
+                "covered": cov.get("covered", 0),
+                "percent": cov.get("percent", 0.0),
+                "missing": cov.get("missing", [])[:50],
+            }
+            rows.append(row)
+            log("corpus", f"      {len(funcs)} funcs, {len(imports)} imports, "
+                          f"{row['covered']} covered ({row['percent']}%)")
+        except Exception as e:
+            rows.append({"title": name, "elf": str(elf), "error": str(e)[:200]})
+            log("corpus", f"      skipped: {e}")
+    out = ROOT / "knowledge" / "corpus.json"
+    gaps: dict[str, dict] = {}
+    for r in rows:
+        for m in r.get("missing", []):
+            g = gaps.setdefault(m["nid"], {"nid": m["nid"],
+                                           "library": m["library"], "titles": 0})
+            g["titles"] += 1
+    gap_list = sorted(gaps.values(), key=lambda x: (-x["titles"], x["library"]))
+    dump_json({"titles": rows, "gaps": gap_list}, out)
+    print()
+    print(f"{'title':<32} {'funcs':>7} {'imports':>8} {'covered':>8} {'%':>6}")
+    for r in rows:
+        if r.get("error"):
+            print(f"{r['title'][:31]:<32} error: {r['error'][:40]}")
+        else:
+            print(f"{r['title'][:31]:<32} {r['functions']:>7} {r['imports']:>8} "
+                  f"{r['covered']:>8} {r['percent']:>6}")
+    if gap_list:
+        print("\nmissing imports shared by the corpus (top 15):")
+        for g in gap_list[:15]:
+            print(f"  {g['library']:<22} {g['nid']}  ({g['titles']} title(s))")
+    print(f"\ncorpus: {out}")
+    return 0
+
+
 def doctor(args) -> int:
     env = discover(save=not args.no_save)
     ok = True
@@ -1817,6 +1927,7 @@ def doctor(args) -> int:
     print(f"clang++     : {env.clangxx or 'MISSING'}")
     print(f"clang-cl    : {env.clang_cl or 'not found (Visual Studio)'}")
     print(f"sccache     : {env.sccache or 'not installed (optional)'}")
+    print(f"ghidra      : {env.ghidra_dir or 'not installed (setup --with-ghidra)'}")
     print(f"python      : {env.python}")
 
     deps = ["capstone", "construct", "Crypto", "tqdm"]
@@ -1867,6 +1978,8 @@ def main(argv=None) -> int:
     s = sub.add_parser("setup", help="download or verify ps3recomp + toolchain")
     s.add_argument("--offline", action="store_true",
                    help="verify the bundled components without any network access")
+    s.add_argument("--with-ghidra", action="store_true",
+                   help="also fetch Ghidra into toolchain/ghidra (independent decoder)")
     s.set_defaults(fn=setup_cmd)
 
     lr = sub.add_parser("learn", help="record a finished port in the knowledge base")
@@ -1896,6 +2009,11 @@ def main(argv=None) -> int:
     a.add_argument("--game", help="game folder (for PARAM.SFO title id)")
     a.add_argument("--json", action="store_true")
     a.set_defaults(fn=analyze_cmd)
+
+    ad = sub.add_parser("analyze-dir", help="analyse every EBOOT.elf under a folder")
+    ad.add_argument("dir")
+    ad.add_argument("--limit", type=int, default=50)
+    ad.set_defaults(fn=analyze_dir_cmd)
 
     p = sub.add_parser("port", help="full pipeline: ELF -> C++ -> (build)")
     p.add_argument("elf")
