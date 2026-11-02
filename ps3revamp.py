@@ -2063,10 +2063,17 @@ def gaps_cmd(args) -> int:
         data = load_json(corpus)
         rows = data.get("titles", []) if isinstance(data, dict) else data
     counts: dict[str, dict] = {}
+
+    def _norm(nid: str) -> str:
+        try:
+            return f"0x{int(str(nid), 16):08X}"
+        except Exception:
+            return str(nid).upper()
+
     for r in rows:
         for m in r.get("missing", []):
             lib = m["library"]
-            nid = m["nid"].upper()
+            nid = _norm(m["nid"])
             c = counts.setdefault(lib, {"library": lib, "nids": {}, "titles": 0})
             c["nids"][nid] = c["nids"].get(nid, 0) + 1
             c["titles"] += 1
@@ -2076,7 +2083,7 @@ def gaps_cmd(args) -> int:
         for lib in sorted({c["library"] for c in counts.values()}):
             for g in kb.coverage_gaps(lib):
                 c = counts.setdefault(lib, {"library": lib, "nids": {}, "titles": 0})
-                c["nids"].setdefault(g["nid"], g["missing_runs"])
+                c["nids"].setdefault(_norm(g["nid"]), g["missing_runs"])
 
     ordered = sorted(counts.values(), key=lambda c: (-len(c["nids"]), c["library"]))
     if not ordered:
@@ -2446,5 +2453,6 @@ def play_cmd(args) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 
 
