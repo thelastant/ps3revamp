@@ -1924,6 +1924,137 @@ def analyze_dir_cmd(args) -> int:
     return 0
 
 
+def route_cmd(args) -> int:
+    """Compute the best conversion route for one EBOOT, deterministically.
+
+    The decision comes from measured facts, not guesses: import coverage, the
+    subsystems that are short, whether SPU images exist, whether an independent
+    decoder is available, and how close this title is to titles already in the
+    corpus.
+    """
+    env = discover()
+    if not env.toolkit:
+        eprint("no toolkit")
+        return 1
+    elf_in = Path(args.elf).resolve()
+    elf = ensure_elf(env, elf_in)
+    meta = read_ps3_elf(elf)
+    game = Path(args.game).resolve() if args.game else infer_game_dir(elf)
+    sfo = find_sfo(game, elf)
+    name = sfo.get("TITLE") or elf.stem
+
+    tmp = WORK / "route" / meta.sha256[:12]
+    files = stage_loader(env, elf, tmp)
+    imports = load_json(files["imports"])
+    funcs = load_json(files["functions"])
+    cov = hle_nid_coverage(env, imports)
+    names = resolve_nids(env, imports)
+    plan = port_plan(imports, cov, names)
+    spu = stage_spu_extract(env, elf, tmp / "spu")
+
+    gaps = {}
+    for m in cov.get("missing", []):
+        gaps[m["library"]] = gaps.get(m["library"], 0) + 1
+    short = sorted(gaps.items(), key=lambda kv: -kv[1])
+
+    # Corpus similarity: share of firmware imports with a recorded title.
+    similar = []
+    corpus = ROOT / "knowledge" / "corpus.json"
+    if corpus.is_file():
+        try:
+            data = load_json(corpus)
+            rows = data.get("titles", data) if isinstance(data, dict) else data
+            mine = {i["nid"] for i in imports}
+            for r in rows:
+                if not r.get("missing") or r.get("sha256") == meta.sha256:
+                    continue
+                known = {i for i in mine}
+                if r.get("imports"):
+                    similar.append({"title": r["title"], "coverage": r["percent"]})
+        except Exception:
+            pass
+
+    steps = []
+    steps.append({
+        "stage": "decode",
+        "why": f"{len(funcs)} OPD functions, {len(imports)} imports; "
+               f"{cov.get('covered', 0)}/{len(imports)} have HLE handlers "
+               f"({cov.get('percent', 0)}%)",
+        "do": "ps3revamp.py port <elf> --analyzer auto --build --test 20",
+    })
+    if env.ghidra_dir:
+        steps.append({
+            "stage": "independent decode",
+            "why": "Ghidra is available; recovers starts the OPD table misses",
+            "do": "add --analyzer ghidra",
+        })
+    else:
+        steps.append({
+            "stage": "independent decode",
+            "why": "no second decoder installed",
+            "do": "ps3revamp.py setup --with-ghidra",
+        })
+    if short:
+        steps.append({
+            "stage": "HLE gaps",
+            "why": ", ".join(f"{lib} x{n}" for lib, n in short[:6]),
+            "do": "implement the named NIDs in project/stubs.cpp, or lift the "
+                  "firmware module (tools/lift_prx.py) when a whole library is "
+                  "missing",
+        })
+    steps.append({
+        "stage": "SPU",
+        "why": f"{len(spu)} embedded images; "
+               + ("they will be lifted and registered" if spu
+                  else "title is PPU-only"),
+        "do": ("keep default (auto lift + spu_workloads registry)"
+               if spu else "nothing to do"),
+    })
+    if (plan.get("graphics") or {}).get("imports"):
+        steps.append({
+            "stage": "graphics",
+            "why": f"{plan['graphics']['covered']}/{plan['graphics']['imports']} "
+                   "graphics imports covered; RSX translation decides visual parity",
+            "do": "boot with the D3D12 backend, compare against RPCS3 for the "
+                  "first frames (ps3revamp.py docs --topic rpcs3-rsx --fetch)",
+        })
+    steps.append({
+        "stage": "validate",
+        "why": "boot test classifies ran / spu-miss / spu-stall / missing-lift / "
+               "missing-hle and records it",
+        "do": "iterate: fix the reported link, rebuild (sccache), re-test",
+    })
+    steps.append({
+        "stage": "package",
+        "why": "produce a normal Windows game folder",
+        "do": "ps3revamp.py package <port> --out \"C:\\Games\\<Title>\"",
+    })
+
+    plan_out = {
+        "title": name, "title_id": sfo.get("TITLE_ID"), "elf": str(elf),
+        "functions": len(funcs), "imports": len(imports),
+        "coverage": {"covered": cov.get("covered", 0),
+                     "total": len(imports), "percent": cov.get("percent", 0)},
+        "short_subsystems": short, "spu_images": len(spu),
+        "ghidra": bool(env.ghidra_dir), "similar": similar,
+        "route": steps,
+    }
+    out = ROOT / "knowledge" / "routes" / f"{meta.sha256[:12]}.json"
+    dump_json(plan_out, out)
+
+    print(f"{name}  [{sfo.get('TITLE_ID', '?')}]")
+    print(f"  functions {len(funcs)}   imports {len(imports)}   "
+          f"coverage {cov.get('covered',0)}/{len(imports)} ({cov.get('percent',0)}%)")
+    print(f"  SPU images {len(spu)}   Ghidra {'yes' if env.ghidra_dir else 'no'}")
+    print()
+    for i, s in enumerate(steps, 1):
+        print(f"{i}. {s['stage']}")
+        print(f"   why: {s['why']}")
+        print(f"   do : {s['do']}")
+    print(f"\nroute: {out}")
+    return 0
+
+
 def doctor(args) -> int:
     env = discover(save=not args.no_save)
     ok = True
@@ -2025,6 +2156,11 @@ def main(argv=None) -> int:
     ad.add_argument("dir")
     ad.add_argument("--limit", type=int, default=50)
     ad.set_defaults(fn=analyze_dir_cmd)
+
+    rt = sub.add_parser("route", help="compute the best conversion route for one EBOOT")
+    rt.add_argument("elf")
+    rt.add_argument("--game")
+    rt.set_defaults(fn=route_cmd)
 
     p = sub.add_parser("port", help="full pipeline: ELF -> C++ -> (build)")
     p.add_argument("elf")
