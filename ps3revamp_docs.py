@@ -74,6 +74,16 @@ TOPICS: dict[str, dict] = {
         "urls": ["https://www.psdevwiki.com/ps3/SELF_-_SPRX"],
         "why": "ELF rejected, SELF not decrypting, ET_DYN/PRX input",
     },
+    "rpcs3-spurs": {
+        "title": "RPCS3 reference implementation of SPURS task syscalls",
+        "urls": ["https://raw.githubusercontent.com/RPCS3/rpcs3/master/rpcs3/Emu/Cell/lv2/sys_spurs.cpp"],
+        "why": "task WAIT_SIGNAL / CreateTask / policy semantics (a spec, not a guess)",
+    },
+    "rpcs3-rsx": {
+        "title": "RPCS3 reference implementation of the RSX command processor",
+        "urls": ["https://raw.githubusercontent.com/RPCS3/rpcs3/master/rpcs3/Emu/RSX/RSXThread.cpp"],
+        "why": "GCM/FIFO behaviour the portable backend does not cover yet",
+    },
 }
 
 ALLOWED_HOSTS = {
@@ -177,6 +187,8 @@ def needs(diag: dict, plan: dict | None = None) -> list[str]:
         want.append("gcm")
     if diag.get("spin_addresses"):
         want.append("ppc")
+    if diag.get("spu_stall"):
+        want.append("rpcs3-spurs")
     for sub, p in (plan or {}).items():
         if sub == "spu" and p.get("imports"):
             want.append("spurs")

@@ -772,9 +772,17 @@ endif()
                 'extern "C" char g_rsx_title_base[128];   /* D3D12 titlebar text */', 1)
             text = text.replace(
                 '    if (!title || !*title) title = "ps3recomp";',
-                '    if (!title || !*title) title = "ps3recomp";\n'
+                '    if (!title || !*title) title = PS3REVAMP_DEFAULT_TITLE;\n'
                 '    snprintf(g_rsx_title_base, sizeof g_rsx_title_base, "%s", title);\n'
                 '    fprintf(stderr, "[ps3revamp] window title: %s\\n", title);', 1)
+            dflt = window_title(name, find_sfo(game_dir, elf))
+            if "#define PS3REVAMP_DEFAULT_TITLE" not in text:
+                text = text.replace(
+                    "static DWORD WINAPI frame_clock(LPVOID)",
+                    '#ifndef PS3REVAMP_DEFAULT_TITLE\n'
+                    f'#define PS3REVAMP_DEFAULT_TITLE "{dflt}"\n'
+                    "#endif\n\n"
+                    "static DWORD WINAPI frame_clock(LPVOID)", 1)
             changed = True
         # A packaged port is a normal game folder: exe at the root,
         # PS3_GAME/USRDIR beside it. With no argument the exe finds its own
