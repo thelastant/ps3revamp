@@ -51,3 +51,21 @@ Reference implementations:
   colour.
 - `port --test` verdict becomes `ran` with `observations` containing a frame
   milestone; the knowledge base records the new handler set.
+
+## Reverse-engineering finding (lifted PPU code)
+
+The guest does contain the producer call. In `recompiled/ppu_recomp_029.cpp` the
+import stub at `0x006AD244` (`_cellSpursLFQueuePushBody`) is called from
+two sites (LR `0x006AAC34` and `0x006AAD9C`). The caller builds a 0x70-byte
+element on its stack and calls push with `blocking = 0`.
+
+So the API is used by the title; the runtime never sees the call because the
+producer thread (`Streamer loader thread`, host tid 11952) does not reach that
+code path at run time. The stall is therefore in guest control flow / task
+pipeline ordering, not a missing stub.
+
+Next diagnostic: sample the loader thread's guest PC while the title is stalled
+(`PS3_SAMPLE_MAIN` / `PS3_SAMPLE_RVAS` in the runtime, or `probe`) to see
+which wait it is parked on before the push, then align the HLE semaphore/event
+semantics it expects.
+
