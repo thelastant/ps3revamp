@@ -69,3 +69,19 @@ Next diagnostic: sample the loader thread's guest PC while the title is stalled
 which wait it is parked on before the push, then align the HLE semaphore/event
 semantics it expects.
 
+
+## Gate experiments (measured)
+
+SEMTID tracing showed the waits: loader -> sem 7, unpack -> sem 10, worker -> sem 5.
+
+- One-shot boost (SPURS_BOOST_SEMS=7,10,5): the loader advanced after sem 7
+  (re-opened stream.dat, dispatched three more tasks), then stalled at the same
+  completion flag. The gates are real, but they are symptoms.
+- Continuous boost (SPURS_BOOST_ALWAYS=1): the worker spins on sem 5
+  (217k log lines in 25s) and no frame appears. The semaphore is not the
+  producer; forcing it only turns a block into a busy loop.
+
+Conclusion unchanged and now experimentally confirmed: the missing component is
+the SPURS taskset policy / job dispatch that would satisfy these gates and push
+work into the LF queue.
+

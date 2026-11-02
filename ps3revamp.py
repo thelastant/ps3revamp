@@ -965,12 +965,15 @@ def build_project(env: Env, proj: Path, jobs: int, fast: bool = False,
             pass
     if (proj / "spu").is_dir():
         cmd.append(f"-DSPU_DIR={proj / 'spu'}")
-    if env.sccache:
-        cmd += [f"-DCMAKE_C_COMPILER_LAUNCHER={env.sccache}",
-                f"-DCMAKE_CXX_COMPILER_LAUNCHER={env.sccache}"]
+    # The compiler launcher must not be present for the MSVC-target GNU driver:
+    # CMake's C++ ABI probe fails when sccache wraps it, and the cached build
+    # then fails to create its object directories. sccache stays on for clang-cl.
     build_env = dict(env.vc_env or os.environ)
     build_env["SCCACHE_DIR"] = str(ROOT / "cache" / "sccache")
     (ROOT / "cache" / "sccache").mkdir(parents=True, exist_ok=True)
+    if env.sccache and not env.clang_vc:
+        cmd += [f"-DCMAKE_C_COMPILER_LAUNCHER={env.sccache}",
+                f"-DCMAKE_CXX_COMPILER_LAUNCHER={env.sccache}"]
     r = run_stream(cmd, env=build_env,
                    only=lambda l: l.startswith("[") or "error" in l.lower())
     if r.returncode != 0:
