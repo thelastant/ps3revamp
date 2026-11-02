@@ -1,0 +1,31 @@
+# Generated ports, caches, vendored toolchains, and the local knowledge store.
+# None of this belongs in git: ports/ contains code translated from a specific
+# game, and the rest is reproducible from vendor.lock.json.
+
+# user/game-derived output
+ports/
+work/
+knowledge/
+cache/
+downloads/
+config.json
+vendor-hashes.json
+
+# fetched third-party trees (see vendor.lock.json for versions + hashes)
+toolkit/
+toolchain/
+python/
+pylibs/
+
+# editor / OS noise
+__pycache__/
+*.pyc
+*.pyo
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# local build leftovers
+*.log
+build/
