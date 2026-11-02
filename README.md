@@ -33,9 +33,15 @@ Command line equivalents:
 ```bat
 python ps3revamp.py doctor
 python ps3revamp.py analyze "C:\path\to\EBOOT.elf"
+python ps3revamp.py auto    "C:\path\to\EBOOT.elf" --game "C:\...\NPUA80068"
 python ps3revamp.py port    "C:\path\to\EBOOT.elf" --game "C:\...\NPUA80068" --build
 python ps3revamp.py play    "ports\Title"
 ```
+
+`auto` is the one-click path: it decrypts/loads the EBOOT, lifts every PPU
+function and embedded SPU image, generates the HLE table, builds at `-O2`
+(release), boot-tests the result, packages a double-clickable game folder and
+records the run in the knowledge base.
 
 Result:
 

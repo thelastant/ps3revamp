@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 PS3revamp -- decrypted PS3 EBOOT.elf -> native C++ port pipeline.
 
@@ -2348,8 +2348,15 @@ def probe_cmd(args) -> int:
     hits = len(re.findall(r"dispatch HIT", text))
     misses = sorted(set(re.findall(r"dispatch MISS fp=(0x[0-9A-Fa-f]+)", text)))
     sleeps = re.findall(r"task (\d+) \(taskset (0x[0-9A-Fa-f]+)\) sleeping (\d+)s in WAIT_SIGNAL", text)
+    pso_fail = len(re.findall(r"\[FP\] PSO FAIL|\[VP\] PSO creation FAIL", text))
+    draws = len(re.findall(r"\[D3D12\] draw_(?:indexed|arrays)", text))
 
     findings = []
+    if pso_fail:
+        findings.append(
+            f"{pso_fail} graphics pipeline(s) failed to create; rerun with "
+            f"D3D12_DBG=1 to get the D3D12 debug-layer reason (a sampler/SRV "
+            f"range, blend enum or format mismatch is named verbatim).")
     if spins:
         ea, last = spins[-1][1], spins[-1][2].split()
         findings.append(
@@ -2371,6 +2378,7 @@ def probe_cmd(args) -> int:
     result = {"verdict": rep.get("boot", {}).get("verdict"),
               "seconds": args.seconds, "dispatch_hits": hits,
               "spu_misses": misses, "unimplemented_nids": unimpl,
+              "draws": draws, "pso_failures": pso_fail,
               "waits": [{"tid": w[0], "seconds": int(w[1]), "pattern": w[2],
                          "flag": w[3]} for w in waits[-3:]],
               "spins": [{"pc": s[0], "ea": s[1], "line": s[2]} for s in spins[-3:]],
@@ -2381,7 +2389,8 @@ def probe_cmd(args) -> int:
     dump_json(result, out / "probe.json")
 
     print(f"probe: {rep.get('title')}")
-    print(f"  {args.seconds}s, {len(lines)} log lines, {hits} SPU dispatch hit(s)")
+    print(f"  {args.seconds}s, {len(lines)} log lines, {hits} SPU dispatch hit(s), "
+          f"{draws} draw(s), {pso_fail} PSO failure(s)")
     for f in findings:
         print(f"  - {f}")
     print(f"\n  full log: {out / 'probe.log'}")
@@ -2761,7 +2770,7 @@ def main(argv=None) -> int:
     b.add_argument("dir")
     b.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4)))
     b.add_argument("--fast", action="store_true", help="build at -O0")
-    b.add_argument("--opt", type=int, default=1, choices=[0, 1, 2, 3])
+    b.add_argument("--opt", type=int, default=2, choices=[0, 1, 2, 3])
     b.set_defaults(fn=build_cmd)
 
     pl = sub.add_parser("play", help="run a finished port")
@@ -2777,6 +2786,27 @@ def main(argv=None) -> int:
     pk.add_argument("--no-assets", action="store_true",
                     help="exe and DLLs only (assets stay where they are)")
     pk.set_defaults(fn=package_cmd)
+
+    au = sub.add_parser("auto", help="one click: EBOOT.elf -> lifted port -> build "
+                                     "-> boot test -> packaged game")
+    au.add_argument("elf")
+    au.add_argument("-o", "--out")
+    au.add_argument("--game")
+    au.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4)))
+    au.set_defaults(fn=None)   # argv is rewritten to `port` before parsing
+
+    # `auto` is the one-click path: the same as `port` but always builds, boot-
+    # tests and packages. Rewrite it into the real command before parsing so
+    # every port option keeps working unchanged.
+    _argv = list(sys.argv[1:] if argv is None else argv)
+    if _argv and _argv[0] == "auto":
+        _argv = ["port"] + _argv[1:] + ["--build", "--test", "20", "--package"]
+    elif _argv and _argv[0] == "port":
+        # A user who points the tool at an EBOOT expects a runnable port, not
+        # just generated C++. Build/test/package are the default; opt out with
+        # --no-build/--no-package.
+        pass
+    argv = _argv
 
     args = ap.parse_args(argv)
     if getattr(args, "toolkit", None):
