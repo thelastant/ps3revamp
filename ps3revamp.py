@@ -2215,6 +2215,45 @@ def probe_cmd(args) -> int:
     if rep.get("game_dir"):
         env["PS3_VFS_ROOT"] = rep["game_dir"]
 
+    if args.modes:
+        modes = [
+            ("baseline", {}),
+            ("sticky-signal", {"SPURS_STICKY_SIGNAL": "1"}),
+            ("interp-unlifted", {"SPU_INTERP_UNLIFTED": "1"}),
+            ("ws-drain", {"LBP_WS_DRAIN": "2"}),
+        ]
+        table = []
+        for name, extra in modes:
+            e = dict(env, **extra)
+            proc = subprocess.Popen([str(exe), str(elf)], cwd=str(exe.parent),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, encoding="utf-8", errors="replace",
+                                    bufsize=1, env=e)
+            lines, t0 = [], time.time()
+            while time.time() - t0 < args.seconds:
+                line = proc.stdout.readline() if proc.stdout else ""
+                if not line:
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                    continue
+                lines.append(line.rstrip("\n"))
+            if proc.poll() is None:
+                proc.terminate()
+            d = classify_boot("\n".join(lines), proc.returncode, args.seconds)
+            table.append({"mode": name, "verdict": d["verdict"],
+                          "spins": d.get("spurs_queue_spin"),
+                          "hits": d.get("spu_hits")})
+            log("probe", f"{name:<15} verdict={d['verdict']} "
+                         f"queue_spin={d.get('spurs_queue_spin') or '-'}")
+        dump_json(table, out / "probe_modes.json")
+        print("\nmode compatibility matrix:")
+        for t in table:
+            print(f"  {t['mode']:<15} {t['verdict']:<12} hits={t['hits']} "
+                  f"spin={t['spins'] or '-'}")
+        print(f"\n  {out / 'probe_modes.json'}")
+        return 0
+
     log("probe", f"running {exe.name} for {args.seconds}s")
     proc = subprocess.Popen([str(exe), str(elf)], cwd=str(exe.parent),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -2400,6 +2439,8 @@ def main(argv=None) -> int:
     pb.add_argument("dir")
     pb.add_argument("--seconds", type=int, default=20)
     pb.add_argument("--hle-trace", type=int, default=100)
+    pb.add_argument("--modes", action="store_true",
+                    help="try the known compatibility modes and compare verdicts")
     pb.set_defaults(fn=probe_cmd)
 
     p = sub.add_parser("port", help="full pipeline: ELF -> C++ -> (build)")
