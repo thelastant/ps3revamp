@@ -106,6 +106,14 @@ def human(n: int) -> str:
         n /= 1024
 
 
+def window_title(name: str, sfo: dict | None) -> str:
+    """ASCII-only title: cmd.exe/`set` and the Win32 ANSI window title are not
+    UTF-8, so a trademark sign in a title would render as mojibake."""
+    tid = (sfo or {}).get("TITLE_ID") or ""
+    t = f"{name} [{tid}]".strip() if tid else (name or "ps3revamp")
+    return t.encode("ascii", "ignore").decode().strip() or "ps3revamp"
+
+
 def load_json(p: Path):
     with open(p, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -736,6 +744,41 @@ endif()
         f"toolkit    : {env.toolkit}\n", encoding="utf-8")
     dump_json({"recompiled": str(recompiled), "toolkit": str(env.toolkit)},
               proj / "ps3revamp.json")
+
+    # Explicit SPU registration. A constructor attribute is not portable
+    # (clang-cl/MSVC ignore __attribute__((constructor)) and /OPT:REF can drop
+    # the .CRT$XCU slot), and an unregistered image is silently DROPPED at
+    # dispatch, leaving cellSpurs waiting forever. Call it from main instead.
+    main_cpp = proj / "main.cpp"
+    if main_cpp.is_file():
+        text = main_cpp.read_text(encoding="utf-8", errors="replace")
+        changed = False
+        if (out / "spu" / "spu_workloads.c").is_file() and "spu_register_all" not in text:
+            import re as _re
+            text = _re.sub(r"(?m)^(void\s+ppu_recomp_register\(void\).*)$",
+                           r"\1\nvoid     spu_register_all(void);   "
+                           r"/* generated: lifted SPU images */", text, count=1)
+            text = text.replace(
+                "ppu_recomp_register();   /* lifted function table -> address map */",
+                "ppu_recomp_register();   /* lifted function table -> address map */\n"
+                "    spu_register_all();      /* register lifted SPU images before any dispatch */", 1)
+            changed = True
+        # The window title must name the title, including after the backend's
+        # once-a-second titlebar refresh (which formats g_rsx_title_base).
+        if "g_rsx_title_base" not in text:
+            text = text.replace(
+                "void     spu_register_all(void);   /* generated: lifted SPU images */",
+                "void     spu_register_all(void);   /* generated: lifted SPU images */\n"
+                'extern "C" char g_rsx_title_base[128];   /* D3D12 titlebar text */', 1)
+            text = text.replace(
+                '    if (!title || !*title) title = "ps3recomp";',
+                '    if (!title || !*title) title = "ps3recomp";\n'
+                '    snprintf(g_rsx_title_base, sizeof g_rsx_title_base, "%s", title);\n'
+                '    fprintf(stderr, "[ps3revamp] window title: %s\\n", title);', 1)
+            changed = True
+        if changed:
+            main_cpp.write_text(text, encoding="utf-8")
+            log("stage", "main.cpp patched: SPU registration + window title")
     return proj
 
 
@@ -898,31 +941,31 @@ def stage_spu_extract(env: Env, elf: Path, out: Path) -> list[Path]:
 
 
 def lift_spu_images(env: Env, images: list[Path], out: Path, jobs: int) -> dict:
-    """Lift every SPU image in parallel: one process per image, up to `jobs`."""
+    """Lift every SPU image and emit the content-fingerprint registry.
+
+    `build_spu_workloads.py` is the toolkit's supported path: it lifts each
+    image under a per-image symbol prefix and writes `spu_workloads.c`, which
+    registers every image by FNV-1a-64 fingerprint with a constructor. Without
+    that registry the runtime cannot match a program the title loads at run
+    time and drops it ("no lifted image ... DROPPED"), which is exactly what
+    leaves cellSpurs waiting forever.
+    """
     if not images:
         return {"ok": True, "images": 0, "lifted": 0}
-    from concurrent.futures import ThreadPoolExecutor
-
-    def one(img: Path):
-        dst = out / img.stem
-        dst.mkdir(parents=True, exist_ok=True)
-        r = run([env.python, env.tool("spu_lifter.py"), img,
-                 "--auto-functions", img,
-                 "--symbol-prefix", f"{img.stem}_",
-                 "--output", dst])
-        ok = r.returncode == 0 and any(dst.glob("*.c"))
-        if not ok:
-            log("spu", f"{(img.name)}: " + (r.stderr or r.stdout).strip().splitlines()[-1][:200])
-        return ok
-
-    with ThreadPoolExecutor(max_workers=max(1, min(jobs, len(images)))) as ex:
-        results = list(ex.map(one, images))
-    try:
-        run([env.python, env.tool("build_spu_workloads.py"), out])
-    except Exception:
-        pass
-    lifted = sum(1 for r in results if r)
-    return {"ok": True, "images": len(images), "lifted": lifted}
+    img_dir = out / "images"
+    r = run([env.python, env.tool("build_spu_workloads.py"),
+             "--images", img_dir,
+             "--lifted", out,
+             "--out", out / "spu_workloads.c",
+             "--constructor"])
+    if r.returncode != 0:
+        log("spu", "build_spu_workloads failed: " + (r.stderr or r.stdout)[-500:])
+        return {"ok": False, "images": len(images), "lifted": 0,
+                "error": (r.stderr or r.stdout)[-800:]}
+    lifted = sum(1 for p in out.glob("*/spu_recomp.c"))
+    reg = out / "spu_workloads.c"
+    return {"ok": reg.is_file(), "images": len(images), "lifted": lifted,
+            "registry": str(reg) if reg.is_file() else None}
 
 
 def stage_spu(env: Env, elf: Path, out: Path, jobs: int) -> dict:
@@ -1150,16 +1193,23 @@ def port(args) -> int:
             break
     if exe:
         stage_runtime_dlls(env, exe.parent)
-    write_launcher(out, proj, exe, elf, game_dir)
+    write_launcher(out, proj, exe, elf, game_dir,
+                   title=window_title(name, sfo))
     report["exe"] = str(exe) if exe else None
 
     if exe and args.test > 0:
-        diag = stage_smoke(env, exe, elf, game_dir, args.test)
+        diag = stage_smoke(env, exe, elf, game_dir, args.test,
+                           title=window_title(name, sfo))
         (out / "boot.log").write_text("\n".join(diag.pop("log_tail")), encoding="utf-8")
         report["boot"] = diag
         log("test", f"verdict: {diag['verdict']}")
         if diag["unresolved_calls"]:
             log("test", f"missing lifted functions at: {diag['unresolved_calls'][:8]}")
+        if diag.get("spu_misses"):
+            log("test", f"{len(diag['spu_misses'])} SPU program(s) dispatched with no "
+                        f"lifted image -- registration is missing or the image differs")
+            for m in diag["spu_misses"][:5]:
+                log("test", f"  fp={m['fp']} size={m['size']}")
         if diag["unimplemented_nids"]:
             log("test", f"{len(diag['unimplemented_nids'])} unimplemented NIDs "
                         f"(the runtime returns CELL_OK for these by default)")
@@ -1237,23 +1287,26 @@ def stage_runtime_dlls(env: Env, dst: Path) -> list[str]:
 
 
 def write_launcher(out: Path, proj: Path, exe: Path | None, elf: Path,
-                   game: Path | None) -> None:
-    """play.cmd + a short README inside the port tree."""
+                   game: Path | None, title: str | None = None) -> None:
+    """play.cmd + play.ps1 inside the port tree."""
     root = game or elf.parent
     if not exe:
         return
+    tline = f'set "PS3_TITLE={title}"\r\n' if title else ""
     (out / "play.cmd").write_text(
         "@echo off\r\n"
         f'set "PS3_VFS_ROOT={root}"\r\n'
+        + tline +
         f'cd /d "{exe.parent}"\r\n'
         f'"{exe}" "{elf}" %*\r\n', encoding="utf-8")
     (out / "play.ps1").write_text(
         f'$env:PS3_VFS_ROOT = "{root}"\n'
-        f'& "{exe}" "{elf}" @args\n', encoding="utf-8")
+        + (f'$env:PS3_TITLE = "{title}"\n' if title else "")
+        + f'& "{exe}" "{elf}" @args\n', encoding="utf-8")
 
 
 def stage_smoke(env: Env, exe: Path, elf: Path, game: Path | None,
-                seconds: int) -> dict:
+                seconds: int, title: str | None = None) -> dict:
     """Boot the built port for N seconds and classify what happened.
 
     This is the difference between "it compiled" and "it runs": the log tells us
@@ -1262,6 +1315,8 @@ def stage_smoke(env: Env, exe: Path, elf: Path, game: Path | None,
     envv = dict(os.environ)
     envv["PS3_HLE_UNRESOLVED"] = "ok"
     envv["PS3_HLE_TRACE"] = "300"
+    if title:
+        envv["PS3_TITLE"] = title
     if game:
         envv["PS3_VFS_ROOT"] = str(game)
     log("test", f"booting for {seconds}s: {exe}")
@@ -1299,6 +1354,13 @@ def classify_boot(text: str, rc: int | None, seconds: float) -> dict:
     indirect = sorted(set(re.findall(r"unresolved indirect call -> (0x[0-9A-Fa-f]+)",
                                      text)))
     spins = sorted(set(re.findall(r"HOTREAD\] spinning on (0x[0-9A-Fa-f]+)", text)))
+    spu_miss = sorted(set((fp, int(size)) for fp, size in
+                          re.findall(r"\[spu_workload\][^\n]*?fp=(0x[0-9A-Fa-f]+)"
+                                     r"[^\n]*?size=(\d+)", text)))
+    spu_hits = len(re.findall(r"dispatch HIT", text))
+    spu_block = [int(s) for s in re.findall(r"EventFlagWait BLOCKED[^\n]*? (\d+)s ",
+                                            text)]
+    spu_stall = bool(spu_hits and spu_block and max(spu_block) >= 2)
     reached = []
     for pat, label in ((r"\[milestone\]\s*(.+)", "milestone"),
                        (r"ppu_run returned (-?\d+)", "exit"),
@@ -1309,14 +1371,23 @@ def classify_boot(text: str, rc: int | None, seconds: float) -> dict:
     verdict = "ran"
     if rc is not None and rc not in (0, 1) and rc < 0:
         verdict = "crashed"
-    if indirect:
+    if spu_miss:
+        verdict = "spu-miss"
+    elif spu_stall:
+        verdict = "spu-stall"
+    elif indirect:
         verdict = "missing-lift"
     elif unimpl and not reached:
         verdict = "missing-hle"
+    if spu_stall:
+        reached.append(f"spu-stall: {spu_hits} dispatch hit(s), "
+                       f"event-flag wait {max(spu_block)}s")
     return {
         "ran": True, "seconds": round(seconds, 1), "exit": rc,
         "verdict": verdict, "unimplemented_nids": unimpl[:200],
         "unresolved_calls": indirect[:200], "spin_addresses": spins[:50],
+        "spu_misses": [{"fp": fp, "size": size} for fp, size in spu_miss][:50],
+        "spu_hits": spu_hits, "spu_stall": spu_stall,
         "observations": reached[-20:], "log_tail": text.splitlines()[-80:],
     }
 

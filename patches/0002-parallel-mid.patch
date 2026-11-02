@@ -1,0 +1,135 @@
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index a657ba6..284b00a 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -1001,6 +1001,8 @@ class PPULifter:
+ 
+     def __init__(self, prefix: str = "", weak_emit: bool = False):
+         self.functions: list[LiftedFunction] = []
++        self.seg_blobs: list[tuple[int, bytes]] = []
++        self.big_endian = True
+         self.call_targets: set[int] = set()
+         self.branch_targets: set[int] = set()  # all func_X references (b/bc trampolines)
+         # Addresses that begin a function prologue (stdu r1,-N, adjusted back to a
+@@ -3891,6 +3893,7 @@ class PPULifter:
+ 
+         count = 0
+         gap_targets: list[int] = []
++        mid_targets: list[tuple[int, int]] = []
+         for target in sorted(all_refs):
+             # Binary search: find the function whose range contains target
+             container = None
+@@ -3927,6 +3930,29 @@ class PPULifter:
+             # short tail from any interior entry; bounding it keeps the common case
+             # exact and turns the pathological case into a harmless truncated stub.
+             fend = min(fend, target + _MAX_MID_TAIL)
++            mid_targets.append((target, fend))
++
++        # Each tail entry is independent: same input instructions, no shared
++        # mutable state beyond "which functions exist". That makes the pass
++        # embarrassingly parallel, and on a big title it is the slowest phase
++        # left (thousands of tails x up to 25 passes). PS3RECOMP_MID_JOBS > 1
++        # lifts the batch in worker processes and merges deterministically.
++        mid_jobs = int(os.environ.get("PS3RECOMP_MID_JOBS", "1") or 1)
++        if mid_jobs > 1 and len(mid_targets) >= 64 and self.seg_blobs:
++            try:
++                for func, cts, bts, cont in self._parallel_mid_entries(mid_targets, mid_jobs):
++                    self.functions.append(func)
++                    self.call_targets.update(cts)
++                    self.branch_targets.update(bts)
++                    defined.add(func.start_addr)
++                    count += 1
++                    if cont:
++                        self.branch_targets.add(cont)
++                mid_targets = []
++            except Exception as exc:   # any pool trouble -> serial, never fail
++                print(f"  [mid] parallel pass failed ({exc}); serial fallback",
++                      file=sys.stderr)
++        for target, fend in mid_targets:
+             tail_func = self.lift_function(_insn_slice(target, fend), target, fend)
+             # lift_function already appends to self.functions, so it's included
+             # in output. Update defined set so we don't re-generate.
+@@ -3966,6 +3992,27 @@ class PPULifter:
+ 
+         return count
+ 
++    def _parallel_mid_entries(self, mid_targets, jobs):
++        """Lift independent mid-function tails across worker processes.
++
++        Each tail is re-disassembled from its own 4-byte-aligned byte range and
++        lifted by a fresh Lifter with the parent's configuration, so the workers
++        share no mutable state. Results come back in input order.
++        """
++        import multiprocessing as mp
++        cfg = {
++            "prefix": self.prefix, "weak": self.weak_emit,
++            "hle": self.hle_stub_nids, "jump": self.jump_tables,
++            "patches": self.insn_patches, "names": self.name_map,
++            "entries": self.function_entries,
++            "lo": self.code_lo, "hi": self.code_hi,
++        }
++        procs = max(1, min(jobs, len(mid_targets)))
++        with mp.Pool(processes=procs, initializer=_mid_init,
++                     initargs=(self.seg_blobs, self.big_endian, cfg)) as pool:
++            return pool.map(_mid_task, mid_targets,
++                            chunksize=max(1, len(mid_targets) // (procs * 8)))
++
+     def _register_continuation(self, func) -> None:
+         """If a lifted tail fell off its (possibly capped) end, promote the
+         continuation address to a branch target so a later mid-function pass
+@@ -4951,6 +4998,43 @@ def _worker_lift(task):
+     return idx0, results, lifter.call_targets, lifter.branch_targets
+ 
+ 
++_MID_CFG: dict = {}
++
++
++def _mid_init(segs, big_endian, cfg):
++    _MID_CFG["segs"] = segs
++    _MID_CFG["be"] = big_endian
++    _MID_CFG["cfg"] = cfg
++
++
++def _mid_task(task):
++    """Lift one mid-function tail entry in a worker process."""
++    target, fend = task
++    cfg = _MID_CFG["cfg"]
++    insns = []
++    for vaddr, blob in _MID_CFG["segs"]:
++        if vaddr <= target < vaddr + len(blob):
++            lo = target - vaddr
++            hi = min(len(blob), fend - vaddr)
++            insns = disassemble_bytes(blob[lo:hi], target, _MID_CFG["be"])
++            break
++    lifter = PPULifter(cfg["prefix"], cfg["weak"])
++    lifter.hle_stub_nids = cfg["hle"]
++    lifter.jump_tables = cfg["jump"]
++    lifter.insn_patches = cfg["patches"]
++    lifter.name_map = cfg["names"]
++    lifter.function_entries = cfg["entries"]
++    lifter.code_lo = cfg["lo"]
++    lifter.code_hi = cfg["hi"]
++    func = lifter.lift_function(insns, target, fend)
++    cont = func.fallthrough_to
++    if cont and cfg["hi"] is not None and not (cfg["lo"] <= cont < cfg["hi"]):
++        cont = None
++    # Everything this tail introduced must come back to the parent: its own
++    # call/branch references decide what the next pass has to lift.
++    return (func, sorted(lifter.call_targets), sorted(lifter.branch_targets), cont)
++
++
+ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
+     import multiprocessing as mp
+ 
+@@ -5542,6 +5626,11 @@ def main() -> None:
+                 loaded += 1
+         print(f"  Loaded {loaded} recovered names from {args.names}")
+ 
++    # The mid-function pass may re-lift tails in worker processes; they need the
++    # raw segments (re-disassembled per tail) and the endianness.
++    lifter.seg_blobs = seg_blobs
++    lifter.big_endian = big_endian
++
+     if args.jobs > 1:
+         _parallel_lift(lifter, func_bounds, seg_blobs, big_endian, args.jobs)
+     else:

@@ -1,0 +1,23 @@
+diff --git a/tools/build_spu_workloads.py b/tools/build_spu_workloads.py
+index 2eef378..a70130b 100644
+--- a/tools/build_spu_workloads.py
++++ b/tools/build_spu_workloads.py
+@@ -234,8 +234,17 @@ def write_registry(args, imgs, text_fps, image_ids=None):
+     L.append("}")
+     if args.constructor:
+         L.append("")
+-        L.append("/* Auto-register at startup (before the game adds any SPURS workload/task). */")
++        L.append("/* Auto-register at startup (before the game adds any SPURS workload/task).")
++        L.append(" * MSVC/clang-cl ignore __attribute__((constructor)); use the CRT")
++        L.append(" * initialiser section there, which runs before main() too. */")
++        L.append("#if defined(_MSC_VER)")
++        L.append(f"static void __cdecl {args.register_fn}_ctor(void);")
++        L.append("#pragma section(\".CRT$XCU\", read)")
++        L.append(f"__declspec(allocate(\".CRT$XCU\")) static void (__cdecl *{args.register_fn}_ptr)(void) = {args.register_fn}_ctor;")
++        L.append(f"static void __cdecl {args.register_fn}_ctor(void)")
++        L.append("#else")
+         L.append(f"__attribute__((constructor)) static void {args.register_fn}_ctor(void)")
++        L.append("#endif")
+         L.append("{")
+         L.append(f"    {args.register_fn}();")
+         L.append("}")

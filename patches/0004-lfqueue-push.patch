@@ -1,0 +1,58 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 82ea66c..0cac4a6 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -3479,3 +3479,53 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
+     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
+     return CELL_OK;
+ }
++
++/* SDK ABI: _cellSpursLFQueuePushBody(CellSpursLFQueue*, const void*, unsigned
++ * isBlocking). The queue is the big-endian line _cellSpursLFQueueInitialize
++ * wrote: +0x00 pop, +0x04 push, +0x0C depth (ring modulus), +0x10 element size,
++ * +0x18 buffer EA. Indices use the ~busy convention; a slot is (index % depth).
++ *
++ * Titles that hand work to a resident SPU policy through this queue were stuck
++ * before it existed: the push returned CELL_OK without writing anything, the
++ * policy saw an empty queue, and every task sat in WAIT_SIGNAL while the PPU
++ * waited on the completion event flag (a permanent blue frame).
++ */
++s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
++{
++    if (!queue_ea || !data_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
++    if (queue_ea & 0x7F)       return CELL_SPURS_TASK_ERROR_ALIGN;
++
++    uint32_t q    = (uint32_t)queue_ea;
++    int32_t  w0   = (int32_t)vm_read32(q + 0x00);
++    int32_t  w1   = (int32_t)vm_read32(q + 0x04);
++    int32_t  mod  = (int32_t)vm_read32(q + 0x0C);
++    uint32_t size = vm_read32(q + 0x10);
++    uint32_t buf  = vm_read32(q + 0x18);
++    if (mod <= 0 || !size || !buf) return CELL_SPURS_TASK_ERROR_INVAL;
++
++    int32_t pop  = (w0 < 0) ? ~w0 : w0;
++    int32_t push = (w1 < 0) ? ~w1 : w1;
++    int32_t used = (pop > push) ? (push - pop + 2 * mod) : (push - pop);
++
++    if (used >= mod) {
++        static int _full = 0;
++        if (PS3_LOG_FIRST(_full, 4))
++            printf("[cellSpurs] LFQueuePushBody queue full (q=0x%08X used=%d/%d)\n",
++                   q, used, mod);
++        return isBlocking ? CELL_SPURS_TASK_ERROR_BUSY : CELL_SPURS_TASK_ERROR_AGAIN;
++    }
++
++    uint32_t slot = (uint32_t)(push % mod);
++    memcpy(vm_base + buf + slot * size, vm_base + (uint32_t)data_ea, size);
++
++    /* Publish: mark busy, then the new index (the consumer treats a negative
++     * index as "operation in progress" and masks it). */
++    vm_write32(q + 0x04, (uint32_t)~(push + 1));
++    vm_write32(q + 0x04, (uint32_t)(push + 1));
++
++    static int _n = 0;
++    if (PS3_LOG_FIRST(_n, 8))
++        printf("[cellSpurs] LFQueuePushBody(q=0x%08X slot=%u size=%u used=%d/%d)\n",
++               q, slot, size, used + 1, mod);
++    return CELL_OK;
++}

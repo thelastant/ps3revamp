@@ -149,6 +149,13 @@ class KnowledgeBase:
                                                   resolution, seen_at)
                    VALUES (?,?,?,?,?,?)""",
                 (sha, "call", call, "", "relift with CFG seeds", now))
+        for miss in (boot or {}).get("spu_misses") or []:
+            self.db.execute(
+                """INSERT OR IGNORE INTO blockers (sha, kind, detail, name,
+                                                  resolution, seen_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (sha, "spu", f"{miss.get('fp')} size={miss.get('size')}", "",
+                 "lift + register this SPU image", now))
 
         self._learn_settings(report)
         self.db.commit()

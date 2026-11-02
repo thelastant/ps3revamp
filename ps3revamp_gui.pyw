@@ -267,6 +267,10 @@ class App(tk.Tk):
         env = os.environ.copy()
         if self.report.get("game_dir"):
             env["PS3_VFS_ROOT"] = self.report["game_dir"]
+        t = self.report.get("title") or "ps3revamp"
+        tid = (self.report.get("sfo") or {}).get("TITLE_ID")
+        t = (f"{t} [{tid}]" if tid else t).encode("ascii", "ignore").decode().strip()
+        env["PS3_TITLE"] = t or "ps3revamp"
         subprocess.Popen([exe, elf], cwd=str(Path(exe).parent), env=env)
 
     def open_folder(self):
