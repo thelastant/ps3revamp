@@ -1,23 +1,28 @@
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 82ea66c..1ce62f6 100644
+index 82ea66c..067de58 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
-@@ -1162,6 +1162,14 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+@@ -1152,13 +1152,18 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
+              * waits on concurrent PPU-side signals will want the async lv2
+              * SPU-thread path instead â€” wired when a title exercises it. */
+             if (elf) {
++                /* Reference order (RPCS3 task_start): latch the task's signalled
++                 * bit first, then let the task be entered. Entering first races
++                 * the task's own WAIT_SIGNAL and parks it. */
++                if (getenv("SPURS_NO_AUTOSTART") == NULL)
++                    spu_taskset_signal_task(taskset_ea, i);
+                 /* elf/context are guest effective addresses; translate the image
+                  * pointer to host memory for fingerprint+load, but keep context
+                  * as the guest EA (the SPU job's DMA uses guest EAs / r3). */
+                 const uint8_t* host_elf = GUEST_PTR(elf, const uint8_t*);
+                 size_t sz = spu_elf_image_size(host_elf, 2u * 1024 * 1024);
+                 if (sz)
+-                    /* Async: SPURS tasks are persistent workers â€” running them
++                    /* Async: SPURS tasks are persistent workers - running them
                       * inline would block this PPU thread forever (deadlock). */
                      spu_workload_dispatch_async(host_elf, (uint32_t)sz,
                                                  (uint32_t)(uintptr_t)context);
-+                /* A SPURS task starts in WAIT_SIGNAL and only enters its body
-+                 * once it is signalled. Titles that expect the taskset policy to
-+                 * deliver that first signal never get it from a pure HLE policy,
-+                 * so the task parks at ran=0ms and the PPU waits forever on the
-+                 * completion event flag (blue frame). Deliver the start signal
-+                 * here, as task creation does on the console. */
-+                if (getenv("SPURS_NO_AUTOSTART") == NULL)
-+                    spu_taskset_signal_task(taskset_ea, i);
-             }
-             return CELL_OK;
-         }
-@@ -3479,3 +3487,53 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
+@@ -3479,3 +3484,53 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
      if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
      return CELL_OK;
  }
