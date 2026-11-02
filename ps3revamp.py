@@ -776,9 +776,43 @@ endif()
                 '    snprintf(g_rsx_title_base, sizeof g_rsx_title_base, "%s", title);\n'
                 '    fprintf(stderr, "[ps3revamp] window title: %s\\n", title);', 1)
             changed = True
+        # A packaged port is a normal game folder: exe at the root,
+        # PS3_GAME/USRDIR beside it. With no argument the exe finds its own
+        # EBOOT.elf, so double-clicking works like any Windows game.
+        if "s_default_elf" not in text:
+            old = ('    if (argc < 2) {\n'
+                   '        printf("usage: %s <PPU ELF>\\n", argv[0]);\n'
+                   '        return 2;\n'
+                   '    }')
+            new = ('#ifdef _WIN32\n'
+                   '    static char s_default_elf[1024];\n'
+                   '    if (argc < 2) {\n'
+                   '        char exe_path[1024];\n'
+                   '        if (GetModuleFileNameA(NULL, exe_path, sizeof exe_path)) {\n'
+                   '            char* slash = strrchr(exe_path, \'\\\\\');\n'
+                   '            if (slash) *slash = 0;\n'
+                   '            snprintf(s_default_elf, sizeof s_default_elf,\n'
+                   '                     "%s\\\\PS3_GAME\\\\USRDIR\\\\EBOOT.elf", exe_path);\n'
+                   '            FILE* f = fopen(s_default_elf, "rb");\n'
+                   '            if (!f) {\n'
+                   '                snprintf(s_default_elf, sizeof s_default_elf,\n'
+                   '                         "%s\\\\EBOOT.elf", exe_path);\n'
+                   '                f = fopen(s_default_elf, "rb");\n'
+                   '            }\n'
+                   '            if (f) { fclose(f); argv[1] = s_default_elf; argc = 2; }\n'
+                   '        }\n'
+                   '    }\n'
+                   '#endif\n'
+                   '    if (argc < 2) {\n'
+                   '        printf("usage: %s <PPU ELF>\\n", argv[0]);\n'
+                   '        return 2;\n'
+                   '    }')
+            if old in text:
+                text = text.replace(old, new, 1)
+                changed = True
         if changed:
             main_cpp.write_text(text, encoding="utf-8")
-            log("stage", "main.cpp patched: SPU registration + window title")
+            log("stage", "main.cpp patched (SPU registration, title, argless boot)")
     return proj
 
 
@@ -1902,6 +1936,16 @@ def main(argv=None) -> int:
     pl.add_argument("dir")
     pl.set_defaults(fn=play_cmd)
 
+    pk = sub.add_parser("package", help="assemble a normal Windows game folder "
+                                        "(<Title>.exe + PS3_GAME/USRDIR)")
+    pk.add_argument("dir")
+    pk.add_argument("--out")
+    pk.add_argument("--link-assets", action="store_true",
+                    help="junction the assets instead of copying them")
+    pk.add_argument("--no-assets", action="store_true",
+                    help="exe and DLLs only (assets stay where they are)")
+    pk.set_defaults(fn=package_cmd)
+
     args = ap.parse_args(argv)
     if getattr(args, "toolkit", None):
         os.environ["PS3RECOMP_DIR"] = args.toolkit
@@ -1969,6 +2013,79 @@ def build_cmd(args) -> int:
     print(logtext[-4000:])
     print("BUILD OK" if ok else "BUILD FAILED")
     return 0 if ok else 1
+
+
+def package_cmd(args) -> int:
+    """Assemble a normal Windows game folder: <Title>.exe + PS3_GAME/USRDIR.
+
+    The generated exe looks for PS3_GAME\\USRDIR\\EBOOT.elf next to itself when
+    started without arguments, and derives the VFS root from that path, so the
+    packaged folder is double-clickable and relocatable.
+    """
+    src = Path(args.dir).resolve()
+    rep_path = src / "port.json"
+    if not rep_path.is_file():
+        eprint(f"no port.json in {src}")
+        return 1
+    rep = load_json(rep_path)
+    exe = Path(rep.get("exe") or "")
+    if not exe.is_file():
+        eprint("no built executable -- run `ps3revamp build <port>` first")
+        return 1
+
+    title = window_title(rep.get("title") or "game", rep.get("sfo"))
+    safe = re.sub(r'[<>:"/\\|?*]', "-", title).strip() or "game"
+    dst = Path(args.out).resolve() if args.out else src / "dist"
+    dst.mkdir(parents=True, exist_ok=True)
+
+    for dll in exe.parent.glob("*.dll"):
+        shutil.copy2(dll, dst / dll.name)
+    target_exe = dst / f"{safe}.exe"
+    shutil.copy2(exe, target_exe)
+    log("package", f"exe -> {target_exe}")
+
+    game = Path(rep["game_dir"]).resolve() if rep.get("game_dir") else None
+    if game and not args.no_assets:
+        usrdir = game / "USRDIR"
+        dest = dst / "PS3_GAME" / "USRDIR"
+        if not usrdir.is_dir():
+            eprint(f"! no USRDIR in {game}; skipping assets")
+        elif args.link_assets and sys.platform == "win32":
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(dest), str(usrdir)],
+                               capture_output=True, text=True)
+            log("package", "assets linked" if r.returncode == 0 else
+                 "link failed, copying instead")
+            if r.returncode != 0:
+                shutil.copytree(usrdir, dest)
+        else:
+            log("package", f"copying assets from {usrdir} (this can take a while)")
+            shutil.copytree(usrdir, dest)
+        sfo = find_sfo(game, exe)
+        if sfo:
+            sfo_path = game / "PARAM.SFO"
+            if sfo_path.is_file():
+                shutil.copy2(sfo_path, dst / "PS3_GAME" / "PARAM.SFO")
+            else:
+                parent_sfo = game.parent / "PARAM.SFO"
+                if parent_sfo.is_file():
+                    shutil.copy2(parent_sfo, dst / "PS3_GAME" / "PARAM.SFO")
+
+    dump_json({
+        "title": rep.get("title"), "title_id": (rep.get("sfo") or {}).get("TITLE_ID"),
+        "exe": str(target_exe), "packaged": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source_port": str(src), "assets": "linked" if args.link_assets else "copied",
+    }, dst / "ps3revamp.game.json")
+    (dst / "README.txt").write_text(
+        f"{rep.get('title')}\n\n"
+        f"Run: {safe}.exe\n\n"
+        f"This folder is the port. It contains only translated code and the\n"
+        f"components needed to run it; the game data was copied from your own\n"
+        f"disc/update, not redistributed.\n", encoding="utf-8")
+    log("package", f"done: {dst}")
+    print(f"Game folder : {dst}")
+    print(f"Launch      : \"{target_exe}\"")
+    return 0
 
 
 def play_cmd(args) -> int:
