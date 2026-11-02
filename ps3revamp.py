@@ -1149,6 +1149,17 @@ def port(args) -> int:
         files["functions"] = analysis / "functions.merged.json"
         functions = merged
     report["analyzer"] = analyzer_status
+    ghidra_names: Path | None = None
+    if analyzer_status.get("source") == "ghidra":
+        names_out = analysis / "ghidra_names.json"
+        r = run([env.python, env.tool("ghidra_names.py"),
+                 analysis / "ghidra", "-o", names_out])
+        if names_out.is_file():
+            ghidra_names = names_out
+            try:
+                log("stage", f"      {len(load_json(names_out))} readable names from Ghidra")
+            except Exception:
+                pass
 
     log("stage", "3/6 coverage -- which firmware imports have HLE handlers")
     cov = f_cov.result()
@@ -1214,7 +1225,7 @@ def port(args) -> int:
     else:
         stage_lift(env, elf, files["functions"], files["imports"], recompiled,
                    jobs=args.jobs, chunk_lines=args.chunk_lines,
-                   names=Path(args.names).resolve() if args.names else None,
+                   names=Path(args.names).resolve() if args.names else ghidra_names,
                    code_end=meta.text_end, extra=args.lifter_arg or [],
                    chunks=chunks)
     units = sorted(recompiled.glob("*.c")) + sorted(recompiled.glob("*.cpp"))
