@@ -147,6 +147,7 @@ class Env:
     vcvars: Path | None = None
     sccache: Path | None = None
     ghidra_dir: Path | None = None
+    clang_vc: bool = False
     python: Path = Path(sys.executable)
     ida_python: Path | None = None   # interpreter that can `import idapro`
     problems: list[str] = field(default_factory=list)
@@ -288,6 +289,14 @@ def discover(save: bool = False) -> Env:
     env.ninja = env.ninja or _find_exe(Path(shutil.which("ninja") or ""))
     env.clang = env.clang or _find_exe(Path(shutil.which("clang") or ""))
     env.clangxx = env.clangxx or _find_exe(Path(shutil.which("clang++") or ""))
+    # Prefer the bundled LLVM 23 GNU driver (clang.exe / clang++.exe). It has the
+    # MSVC target triple, so it uses the Visual Studio headers/libs and keeps the
+    # ABI the runtime needs, while remaining the plain clang driver.
+    llvm_clang = ROOT / "toolchain" / "llvm" / "bin" / "clang.exe"
+    llvm_clangxx = ROOT / "toolchain" / "llvm" / "bin" / "clang++.exe"
+    if llvm_clang.is_file() and llvm_clangxx.is_file():
+        env.clang, env.clangxx = llvm_clang, llvm_clangxx
+        env.clang_vc = True
     env.sccache = _find_exe(ROOT / "toolchain" / "sccache" / "sccache.exe")
 
     # Ghidra is used as an independent decoder for any EBOOT: it recovers
@@ -902,7 +911,8 @@ def build_project(env: Env, proj: Path, jobs: int, fast: bool = False,
     """Configure + build. clang-cl/MSVC-ABI is preferred on Windows."""
     lift_opt = 0 if fast else max(0, min(3, opt))
     flags = ["-DNDEBUG"]
-    use_vc = bool(env.clang_cl and env.vc_env)
+    use_vc = bool(env.clang_cl and env.vc_env and
+                  os.environ.get("PS3REVAMP_USE_CLANG_CL"))
     if use_vc:
         cc = env.clang_cl
         runtime_opt = "/Od" if fast else "/O2"
@@ -2565,10 +2575,11 @@ def doctor(args) -> int:
     print(f"ninja       : {env.ninja or 'MISSING'}")
     print(f"clang       : {env.clang or 'MISSING'}")
     print(f"clang++     : {env.clangxx or 'MISSING'}")
+    if env.clang:
+        v = _clang_version(env.clang)
+        print(f"              clang {v[0]}.{v[1]}.{v[2]} (GNU driver, used by default)")
     print(f"clang-cl    : {env.clang_cl or 'not found (Visual Studio)'}")
-    if env.clang_cl:
-        v = _clang_version(env.clang_cl)
-        print(f"              clang {v[0]}.{v[1]}.{v[2]}")
+    print(f"              (only with PS3REVAMP_USE_CLANG_CL=1)")
     print(f"sccache     : {env.sccache or 'not installed (optional)'}")
     print(f"ghidra      : {env.ghidra_dir or 'not installed (setup --with-ghidra)'}")
     print(f"python      : {env.python}")
